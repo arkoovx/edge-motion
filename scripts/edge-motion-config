@@ -1,0 +1,200 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_FILE="${EDGE_MOTION_CONFIG_FILE:-/etc/default/edge-motion}"
+SERVICE_NAME="${EDGE_MOTION_SERVICE_NAME:-edge-motion.service}"
+
+DEFAULT_ARGS=(
+  --no-grab
+  --mode scroll
+  --threshold 0.06
+  --hold-ms 90
+  --pulse-ms 12
+  --pulse-step 1.5
+  --max-speed 2.4
+  --accel-exponent 1.6
+  --deadzone 0.07
+  --scroll-axis-priority dominant
+)
+
+msg() {
+  if command -v whiptail >/dev/null 2>&1; then
+    whiptail --title "edge-motion" --msgbox "$1" 12 78
+  else
+    printf '\n%s\n\n' "$1"
+  fi
+}
+
+confirm() {
+  local text="$1"
+  if command -v whiptail >/dev/null 2>&1; then
+    whiptail --title "edge-motion" --yesno "$text" 12 78
+  else
+    read -r -p "$text [y/N]: " ans
+    [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]]
+  fi
+}
+
+require_root() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    echo "Run this tool as root: sudo edge-motion-config" >&2
+    exit 1
+  fi
+}
+
+read_current_args() {
+  if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+  fi
+
+  if [[ -n "${EDGE_MOTION_ARGS:-}" ]]; then
+    # shellcheck disable=SC2206
+    CURRENT_ARGS=( $EDGE_MOTION_ARGS )
+  else
+    CURRENT_ARGS=("${DEFAULT_ARGS[@]}")
+  fi
+}
+
+find_opt() {
+  local key="$1"; shift
+  local -a arr=("$@")
+  for ((i=0; i<${#arr[@]}; i++)); do
+    if [[ "${arr[i]}" == "$key" ]]; then
+      if (( i + 1 < ${#arr[@]} )) && [[ "${arr[i+1]}" != --* ]]; then
+        printf '%s' "${arr[i+1]}"
+      else
+        printf '1'
+      fi
+      return 0
+    fi
+  done
+  return 1
+}
+
+build_args() {
+  local mode="$1" threshold="$2" hold_ms="$3" pulse_ms="$4" pulse_step="$5" max_speed="$6" accel="$7" deadzone="$8" natural="$9" diagonal="${10}" twofinger="${11}" grab="${12}"
+
+  NEW_ARGS=(
+    --mode "$mode"
+    --threshold "$threshold"
+    --hold-ms "$hold_ms"
+    --pulse-ms "$pulse_ms"
+    --pulse-step "$pulse_step"
+    --max-speed "$max_speed"
+    --accel-exponent "$accel"
+    --deadzone "$deadzone"
+    --scroll-axis-priority dominant
+  )
+
+  if [[ "$natural" == "1" ]]; then NEW_ARGS+=(--natural-scroll); fi
+  if [[ "$diagonal" == "1" ]]; then NEW_ARGS+=(--diagonal-scroll); fi
+  if [[ "$twofinger" == "1" ]]; then NEW_ARGS+=(--two-finger-scroll); fi
+  if [[ "$grab" == "1" ]]; then NEW_ARGS+=(--grab); else NEW_ARGS+=(--no-grab); fi
+}
+
+validate() {
+  local value regex="$1"; value="$2"
+  [[ "$value" =~ $regex ]]
+}
+
+save_and_restart() {
+  {
+    echo "# Managed by edge-motion-config"
+    echo "EDGE_MOTION_ARGS=\"${NEW_ARGS[*]}\""
+  } > "$CONFIG_FILE"
+
+  systemctl daemon-reload
+  systemctl restart "$SERVICE_NAME"
+}
+
+menu_loop() {
+  local mode threshold hold_ms pulse_ms pulse_step max_speed accel deadzone natural diagonal twofinger grab
+
+  mode="$(find_opt --mode "${CURRENT_ARGS[@]}" || echo scroll)"
+  threshold="$(find_opt --threshold "${CURRENT_ARGS[@]}" || echo 0.06)"
+  hold_ms="$(find_opt --hold-ms "${CURRENT_ARGS[@]}" || echo 90)"
+  pulse_ms="$(find_opt --pulse-ms "${CURRENT_ARGS[@]}" || echo 12)"
+  pulse_step="$(find_opt --pulse-step "${CURRENT_ARGS[@]}" || echo 1.5)"
+  max_speed="$(find_opt --max-speed "${CURRENT_ARGS[@]}" || echo 2.4)"
+  accel="$(find_opt --accel-exponent "${CURRENT_ARGS[@]}" || echo 1.6)"
+  deadzone="$(find_opt --deadzone "${CURRENT_ARGS[@]}" || echo 0.07)"
+  natural="$(find_opt --natural-scroll "${CURRENT_ARGS[@]}" || echo 0)"
+  diagonal="$(find_opt --diagonal-scroll "${CURRENT_ARGS[@]}" || echo 0)"
+  twofinger="$(find_opt --two-finger-scroll "${CURRENT_ARGS[@]}" || echo 0)"
+  if find_opt --grab "${CURRENT_ARGS[@]}" >/dev/null; then grab=1; else grab=0; fi
+
+  while true; do
+    local prompt
+    prompt="Текущие значения:\nmode=$mode, threshold=$threshold, hold-ms=$hold_ms, pulse-ms=$pulse_ms\npulse-step=$pulse_step, max-speed=$max_speed, accel=$accel, deadzone=$deadzone\nnatural=$natural, diagonal=$diagonal, two-finger=$twofinger, grab=$grab"
+
+    local action
+    if command -v whiptail >/dev/null 2>&1; then
+      action=$(whiptail --title "edge-motion: меню настройки" --menu "$prompt" 22 88 8 \
+        "edit" "Изменить параметры" \
+        "save" "💾 Сохранить и перезапустить" \
+        "reset" "↺ Сбросить на оптимальные значения" \
+        "exit" "Выход без изменений" 3>&1 1>&2 2>&3) || action="exit"
+    else
+      echo "$prompt"
+      read -r -p "[edit/save/reset/exit]: " action
+    fi
+
+    case "$action" in
+      edit)
+        if command -v whiptail >/dev/null 2>&1; then
+          local form
+          form=$(whiptail --title "edge-motion: редактирование" --inputbox \
+"Введите через пробел:\nmode threshold hold-ms pulse-ms pulse-step max-speed accel deadzone natural(0/1) diagonal(0/1) twofinger(0/1) grab(0/1)\nПример: scroll 0.06 90 12 1.5 2.4 1.6 0.07 1 0 0 0" \
+            18 90 "$mode $threshold $hold_ms $pulse_ms $pulse_step $max_speed $accel $deadzone $natural $diagonal $twofinger $grab" \
+            3>&1 1>&2 2>&3) || continue
+        else
+          read -r -p "Введите параметры: " form
+        fi
+
+        read -r mode threshold hold_ms pulse_ms pulse_step max_speed accel deadzone natural diagonal twofinger grab <<<"$form"
+
+        if ! validate '^(motion|scroll)$' "$mode" || \
+           ! validate '^[0-9]+(\.[0-9]+)?$' "$threshold" || \
+           ! validate '^[0-9]+$' "$hold_ms" || \
+           ! validate '^[0-9]+$' "$pulse_ms" || \
+           ! validate '^[0-9]+(\.[0-9]+)?$' "$pulse_step" || \
+           ! validate '^[0-9]+(\.[0-9]+)?$' "$max_speed" || \
+           ! validate '^[0-9]+(\.[0-9]+)?$' "$accel" || \
+           ! validate '^[0-9]+(\.[0-9]+)?$' "$deadzone" || \
+           ! validate '^[01]$' "$natural" || ! validate '^[01]$' "$diagonal" || \
+           ! validate '^[01]$' "$twofinger" || ! validate '^[01]$' "$grab"; then
+          msg "Ошибка в формате значений. Попробуйте снова."
+          continue
+        fi
+        ;;
+      save)
+        build_args "$mode" "$threshold" "$hold_ms" "$pulse_ms" "$pulse_step" "$max_speed" "$accel" "$deadzone" "$natural" "$diagonal" "$twofinger" "$grab"
+        if confirm "Сохранить и выполнить автоперезапуск сервиса с новыми параметрами?"; then
+          save_and_restart
+          msg "Готово ✅. Конфиг сохранён в $CONFIG_FILE, сервис перезапущен."
+          break
+        fi
+        ;;
+      reset)
+        if confirm "Сбросить параметры на оптимальные значения по умолчанию?"; then
+          CURRENT_ARGS=("${DEFAULT_ARGS[@]}")
+          mode="scroll"; threshold="0.06"; hold_ms="90"; pulse_ms="12"; pulse_step="1.5"
+          max_speed="2.4"; accel="1.6"; deadzone="0.07"; natural="0"; diagonal="0"; twofinger="0"; grab="0"
+          msg "Значения сброшены. Нажмите Save для применения."
+        fi
+        ;;
+      exit)
+        msg "Выход без изменений."
+        break
+        ;;
+      *)
+        msg "Неизвестная команда: $action"
+        ;;
+    esac
+  done
+}
+
+require_root
+read_current_args
+menu_loop

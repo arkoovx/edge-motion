@@ -20,13 +20,13 @@
 #include <libudev.h>
 #include <unistd.h>
 
-#define EDGE_MOTION_VERSION "1.1.0"
+#define EDGE_MOTION_VERSION "1.2.0"
 
 #define DEFAULT_EDGE_THRESHOLD 0.06
 #define DEFAULT_EDGE_HYSTERESIS 0.015
 #define DEFAULT_HOLD_MS 80
 #define DEFAULT_PULSE_MS 10
-#define DEFAULT_PULSE_STEP 3
+#define DEFAULT_PULSE_STEP 1.5
 #define DEFAULT_MAX_SPEED 3.0
 #define TOUCHPAD_DISCONNECT_TIMEOUT_MS 200
 #define TOUCHPAD_REOPEN_POLL_MS 250
@@ -36,7 +36,7 @@ static double edge_threshold = DEFAULT_EDGE_THRESHOLD;
 static double edge_hysteresis = DEFAULT_EDGE_HYSTERESIS;
 static int hold_ms = DEFAULT_HOLD_MS;
 static int pulse_ms = DEFAULT_PULSE_MS;
-static int pulse_step = DEFAULT_PULSE_STEP;
+static double pulse_step = DEFAULT_PULSE_STEP;
 static double max_speed = DEFAULT_MAX_SPEED;
 static int verbose = 0;
 static int list_devices = 0;
@@ -252,7 +252,7 @@ static int apply_config_option(const char *key, const char *value)
     if (strcmp(key, "pulse-ms") == 0)
         return parse_int_arg(value, &pulse_ms);
     if (strcmp(key, "pulse-step") == 0)
-        return parse_int_arg(value, &pulse_step);
+        return parse_double_arg(value, &pulse_step);
     if (strcmp(key, "max-speed") == 0)
         return parse_double_arg(value, &max_speed);
     if (strcmp(key, "mode") == 0)
@@ -765,7 +765,7 @@ static void *pulser_thread(void *arg)
             if (len < 1e-9)
                 goto relock;
             int current_step =
-                (int)lround((double)pulse_step * (1.0 + speed_factor * (max_speed - 1.0)));
+                (int)lround(pulse_step * (1.0 + speed_factor * (max_speed - 1.0)));
             if (current_step < 1)
                 current_step = 1;
             if (current_step > 100)
@@ -848,7 +848,7 @@ static void print_usage(const char *prog)
     printf("  --hysteresis <0.0-0.2>   Edge hysteresis (default %.3f)\n", DEFAULT_EDGE_HYSTERESIS);
     printf("  --hold-ms <ms>           Hold delay before activation (default %d)\n", DEFAULT_HOLD_MS);
     printf("  --pulse-ms <ms>          Pulse interval (default %d)\n", DEFAULT_PULSE_MS);
-    printf("  --pulse-step <n>         Base movement step (default %d)\n", DEFAULT_PULSE_STEP);
+    printf("  --pulse-step <n>         Base movement step (default %.1f)\n", DEFAULT_PULSE_STEP);
     printf("  --max-speed <n>          Max speed multiplier (default %.1f)\n", DEFAULT_MAX_SPEED);
     printf("  --mode <motion|scroll>   Cursor motion or wheel scrolling\n");
     printf("  --natural-scroll         Natural scroll direction\n");
@@ -981,7 +981,7 @@ int main(int argc, char **argv)
             }
             break;
         case 's':
-            if (parse_int_arg(optarg, &pulse_step) < 0) {
+            if (parse_double_arg(optarg, &pulse_step) < 0) {
                 fprintf(stderr, "Invalid pulse-step: %s\n", optarg);
                 return 2;
             }

@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+UPDATE_ENV_FILE="${EDGE_MOTION_UPDATE_CONFIG:-/etc/default/edge-motion-update}"
+REPO_DIR="${EDGE_MOTION_REPO_DIR:-/opt/edge-motion-src}"
+BRANCH="${EDGE_MOTION_UPDATE_BRANCH:-main}"
+
+if [[ -f "$UPDATE_ENV_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$UPDATE_ENV_FILE"
+fi
+
+: "${EDGE_MOTION_AUTO_UPDATE:=1}"
+: "${EDGE_MOTION_REPO_DIR:=$REPO_DIR}"
+: "${EDGE_MOTION_UPDATE_BRANCH:=$BRANCH}"
+
+if [[ "$EDGE_MOTION_AUTO_UPDATE" != "1" ]]; then
+  exit 0
+fi
+
+if ! command -v git >/dev/null 2>&1 || ! command -v make >/dev/null 2>&1; then
+  exit 0
+fi
+
+if [[ ! -d "$EDGE_MOTION_REPO_DIR/.git" ]]; then
+  exit 0
+fi
+
+if ! git -C "$EDGE_MOTION_REPO_DIR" fetch origin "$EDGE_MOTION_UPDATE_BRANCH" --quiet; then
+  logger -t edge-motion-auto-update "fetch failed; skip update"
+  exit 0
+fi
+
+local_rev="$(git -C "$EDGE_MOTION_REPO_DIR" rev-parse HEAD)"
+remote_rev="$(git -C "$EDGE_MOTION_REPO_DIR" rev-parse "origin/$EDGE_MOTION_UPDATE_BRANCH")"
+
+if [[ "$local_rev" == "$remote_rev" ]]; then
+  exit 0
+fi
+
+tmp_dir="$(mktemp -d)"
+cleanup() { rm -rf "$tmp_dir"; }
+trap cleanup EXIT
+
+if ! git -C "$EDGE_MOTION_REPO_DIR" worktree add --detach "$tmp_dir" "origin/$EDGE_MOTION_UPDATE_BRANCH" >/dev/null 2>&1; then
+  logger -t edge-motion-auto-update "cannot create worktree; skip"
+  exit 0
+fi
+
+if make -C "$tmp_dir" deps-check >/dev/null 2>&1 && make -C "$tmp_dir" build >/dev/null 2>&1 && make -C "$tmp_dir" install >/dev/null 2>&1; then
+  if git -C "$EDGE_MOTION_REPO_DIR" merge --ff-only "origin/$EDGE_MOTION_UPDATE_BRANCH" >/dev/null 2>&1; then
+    logger -t edge-motion-auto-update "updated to $remote_rev"
+  else
+    logger -t edge-motion-auto-update "build succeeded, but local repo wasn't fast-forwarded"
+  fi
+else
+  logger -t edge-motion-auto-update "update failed during build/install; keeping existing binary"
+fi
+
+git -C "$EDGE_MOTION_REPO_DIR" worktree remove "$tmp_dir" --force >/dev/null 2>&1 || true

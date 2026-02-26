@@ -4,7 +4,9 @@ After=multi-user.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/edge-motion --no-grab --threshold 0.06 --hold-ms 80 --pulse-ms 10 --pulse-step 3
+EnvironmentFile=-/etc/default/edge-motion
+ExecStartPre=/usr/local/bin/edge-motion-auto-update
+ExecStart=/usr/local/bin/edge-motion $EDGE_MOTION_ARGS
 Restart=always
 RestartSec=2
 KillSignal=SIGTERM
