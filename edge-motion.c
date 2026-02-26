@@ -8,6 +8,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -236,8 +237,7 @@ static int create_uinput_device(void)
     if (fd < 0)
         return -1;
 
-    if (ioctl(fd, UI_SET_EVBIT, EV_KEY) < 0 || ioctl(fd, UI_SET_KEYBIT, BTN_LEFT) < 0 ||
-        ioctl(fd, UI_SET_KEYBIT, BTN_RIGHT) < 0 || ioctl(fd, UI_SET_EVBIT, EV_REL) < 0 ||
+    if (ioctl(fd, UI_SET_EVBIT, EV_REL) < 0 ||
         ioctl(fd, UI_SET_RELBIT, REL_X) < 0 || ioctl(fd, UI_SET_RELBIT, REL_Y) < 0 ||
         ioctl(fd, UI_SET_RELBIT, REL_WHEEL) < 0 || ioctl(fd, UI_SET_RELBIT, REL_HWHEEL) < 0) {
         close(fd);
@@ -441,7 +441,15 @@ static int reopen_touchpad(struct touchpad_resources *tp,
     }
 
     if (use_grab) {
-        int grc = libevdev_grab(tp->dev, LIBEVDEV_GRAB);
+        int grc = 0;
+        int attempts = 3;
+        while (attempts-- > 0) {
+            grc = libevdev_grab(tp->dev, LIBEVDEV_GRAB);
+            if (grc == 0)
+                break;
+            if (attempts > 0)
+                usleep(10000);
+        }
         if (grc < 0 && verbose)
             fprintf(stderr, "Failed to grab touchpad: %s\n", strerror(-grc));
     }
@@ -502,18 +510,23 @@ static void *pulser_thread(void *arg)
         if (!running)
             break;
 
+        bool edge_active = state.edge_active;
         int dx = state.dir_x;
         int dy = state.dir_y;
         double speed_factor = state.speed_factor;
         pthread_mutex_unlock(&state.lock);
 
         int err = 0;
-        if (dx || dy) {
+        if (edge_active && (dx || dy)) {
             double len = hypot((double)dx, (double)dy);
+            if (len < 1e-9)
+                goto relock;
             int current_step =
                 (int)lround((double)pulse_step * (1.0 + speed_factor * (max_speed - 1.0)));
             if (current_step < 1)
                 current_step = 1;
+            if (current_step > 100)
+                current_step = 100;
             int step_x = (int)lround((double)dx / len * (double)current_step);
             int step_y = (int)lround((double)dy / len * (double)current_step);
 
@@ -536,6 +549,7 @@ static void *pulser_thread(void *arg)
             err |= emit_syn(ufd);
         }
 
+relock:
         pthread_mutex_lock(&state.lock);
         if (!running)
             break;
@@ -707,6 +721,10 @@ int main(int argc, char **argv)
         fprintf(stderr, "Invalid arguments. See --help.\n");
         return 2;
     }
+    if (deadzone + edge_threshold > 0.5) {
+        fprintf(stderr, "deadzone + edge_threshold must not exceed 0.5\n");
+        return 2;
+    }
 
     struct sigaction sa = {.sa_handler = handle_signal, .sa_flags = 0};
     sigaction(SIGINT, &sa, NULL);
@@ -763,7 +781,7 @@ int main(int argc, char **argv)
     int was_in_edge_x = 0;
     int was_in_edge_y = 0;
     int touchpad_available = 1;
-    int64_t next_reopen_at_ms = 0;
+    int64_t next_reopen_at_ms = INT64_MAX;
     int slot_count = 1;
     int active_fingers = 0;
     struct timespec edge_enter_time = {0};
@@ -783,7 +801,13 @@ int main(int argc, char **argv)
 
         double speed_factor = 0.0;
         int two_finger_ok = !(mode == EM_MODE_SCROLL && two_finger_scroll) || active_fingers >= 2;
-        if (last_x >= 0 && last_y >= 0 && max_x > min_x && max_y > min_y && two_finger_ok) {
+        if (max_x <= min_x || max_y <= min_y) {
+            last_x = -1;
+            last_y = -1;
+            continue;
+        }
+
+        if (last_x >= 0 && last_y >= 0 && two_finger_ok) {
             double nx = (double)(last_x - min_x) / (double)(max_x - min_x);
             double ny = (double)(last_y - min_y) / (double)(max_y - min_y);
             if (nx > 0.5 - deadzone && nx < 0.5 + deadzone)
