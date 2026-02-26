@@ -9,7 +9,7 @@ LIBS := $(shell pkg-config --libs libevdev libudev 2>/dev/null)
 CPPFLAGS += $(shell pkg-config --cflags libevdev libudev 2>/dev/null)
 LDFLAGS += -pthread -lm
 
-.PHONY: all help build clean install uninstall install-service uninstall-service deps-check install-config check
+.PHONY: all help build clean install uninstall install-service uninstall-service deps-check install-config check update-now
 
 all: build
 
@@ -23,6 +23,7 @@ help:
 	@echo "  make clean              Remove build artifacts"
 	@echo "  make deps-check         Check required dev packages via pkg-config"
 	@echo "  make check              Run lightweight syntax checks"
+	@echo "  make update-now         Run auto-update script manually now"
 
 deps-check:
 	@pkg-config --exists libevdev libudev || \
@@ -35,6 +36,9 @@ build: deps-check
 check:
 	bash -n scripts/edge-motion-config scripts/edge-motion-auto-update
 	@echo "Shell syntax check passed"
+
+update-now:
+	$(BINDIR)/edge-motion-auto-update
 
 clean:
 	rm -f $(APP)
@@ -49,7 +53,7 @@ install-config:
 	install -d $(DESTDIR)/etc/default
 	@if [ ! -f $(DESTDIR)/etc/default/edge-motion ]; then \
 		echo '# Runtime args for edge-motion service' > $(DESTDIR)/etc/default/edge-motion; \
-		echo 'EDGE_MOTION_ARGS="--no-grab --mode scroll --threshold 0.06 --hold-ms 90 --pulse-ms 12 --pulse-step 1.5 --max-speed 2.4 --accel-exponent 1.6 --deadzone 0.07 --scroll-axis-priority dominant"' >> $(DESTDIR)/etc/default/edge-motion; \
+		echo 'EDGE_MOTION_ARGS="--no-grab --mode motion --threshold 0.06 --hold-ms 90 --pulse-ms 12 --pulse-step 1.5 --max-speed 2.4 --accel-exponent 1.6 --deadzone 0.07 --scroll-axis-priority dominant"' >> $(DESTDIR)/etc/default/edge-motion; \
 	fi
 	@if [ ! -f $(DESTDIR)/etc/default/edge-motion-update ]; then \
 		echo '# Auto-update settings for edge-motion' > $(DESTDIR)/etc/default/edge-motion-update; \

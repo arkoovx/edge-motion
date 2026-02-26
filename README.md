@@ -9,7 +9,7 @@
 ## Что вы получите
 
 - Автовыбор подходящего тачпада.
-- Режим **scroll** и режим **motion**.
+- Режим **motion** (по умолчанию) и режим **scroll**.
 - Тонкую настройку чувствительности/ускорения.
 - Восстановление после переподключения устройства.
 - Запуск как `systemd`-сервис (автостарт после ребута).
@@ -53,6 +53,7 @@ sudo /usr/local/bin/edge-motion --list-devices
 
 - Первая открывает понятное меню и сохраняет настройки в `/etc/default/edge-motion`.
 - Вторая помогает, если нужно явно выбрать устройство (`--device /dev/input/eventX`).
+- Для ручного запуска автообновления без перезагрузки: `sudo /usr/local/bin/edge-motion-auto-update` (или `sudo make update-now`).
 
 ---
 
@@ -87,7 +88,7 @@ EDGE_MOTION_UPDATE_BRANCH=main
 ### Профиль A: «мягкий» (обычно самый комфортный)
 
 ```bash
-EDGE_MOTION_ARGS="--no-grab --mode scroll --threshold 0.06 --hold-ms 90 --pulse-ms 12 --pulse-step 1.5 --max-speed 2.4 --accel-exponent 1.6 --deadzone 0.07 --scroll-axis-priority dominant"
+EDGE_MOTION_ARGS="--no-grab --mode motion --threshold 0.06 --hold-ms 90 --pulse-ms 12 --pulse-step 1.5 --max-speed 2.4 --accel-exponent 1.6 --deadzone 0.07 --scroll-axis-priority dominant"
 ```
 
 ### Профиль B: «быстрый»
