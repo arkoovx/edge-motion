@@ -293,8 +293,9 @@ static int check_resource_limits(struct resource_guard_state *guard)
 
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
+    int64_t now_ms = timespec_to_ms(&now);
     if (guard->initialized) {
-        int64_t elapsed_ms = timespec_to_ms(&now) - timespec_to_ms(&guard->last_ts);
+        int64_t elapsed_ms = now_ms - timespec_to_ms(&guard->last_ts);
         if (elapsed_ms < RESOURCE_CHECK_INTERVAL_MS)
             return 0;
     }
@@ -310,7 +311,7 @@ static int check_resource_limits(struct resource_guard_state *guard)
         return 0;
     }
 
-    double elapsed_s = (double)(timespec_to_ms(&now) - timespec_to_ms(&guard->last_ts)) / 1000.0;
+    double elapsed_s = (double)(now_ms - timespec_to_ms(&guard->last_ts)) / 1000.0;
     if (elapsed_s < 0.001)
         return 0;
 
@@ -520,6 +521,13 @@ static inline int emit_syn(int ufd)
 static inline int64_t timespec_to_ms(const struct timespec *ts)
 {
     return ts->tv_sec * 1000LL + ts->tv_nsec / 1000000LL;
+}
+
+static inline int64_t monotonic_now_ms(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return timespec_to_ms(&now);
 }
 
 static int reset_multitouch_state(struct libevdev *dev, int **slot_x, int **slot_y,
@@ -1350,6 +1358,7 @@ int main(int argc, char **argv)
     int active_fingers = 0;
     int pressure_min = 0, pressure_max = 0;
     int last_pressure = -1;
+    int invalid_axes_logged = 0;
     struct timespec edge_enter_time = {0};
 
     read_pressure_range(tp.dev, &pressure_min, &pressure_max);
@@ -1375,10 +1384,22 @@ int main(int argc, char **argv)
         double speed_factor = 0.0;
         int two_finger_ok = !(mode == EM_MODE_SCROLL && two_finger_scroll) || active_fingers >= 2;
         if (max_x <= min_x || max_y <= min_y) {
+            if (verbose && !invalid_axes_logged) {
+                fprintf(stderr,
+                        "Invalid touchpad axis range [%d..%d]x[%d..%d], waiting for recovery...\n",
+                        min_x,
+                        max_x,
+                        min_y,
+                        max_y);
+                invalid_axes_logged = 1;
+            }
+            deactivate_edge_motion();
             last_x = -1;
             last_y = -1;
+            (void)poll(NULL, 0, RESOURCE_CHECK_INTERVAL_MS);
             continue;
         }
+        invalid_axes_logged = 0;
 
         if (last_x >= 0 && last_y >= 0 && two_finger_ok) {
             double nx = (double)(last_x - min_x) / (double)(max_x - min_x);
@@ -1496,9 +1517,7 @@ int main(int argc, char **argv)
         }
 
         if (!touchpad_available) {
-            struct timespec now;
-            clock_gettime(CLOCK_MONOTONIC, &now);
-            int64_t now_ms = now.tv_sec * 1000LL + now.tv_nsec / 1000000LL;
+            int64_t now_ms = monotonic_now_ms();
             int64_t remaining = next_reopen_at_ms - now_ms;
             timeout_ms = remaining > 0 ? (int)remaining : 0;
         }
@@ -1636,9 +1655,7 @@ int main(int argc, char **argv)
         }
 
         if (!touchpad_available && running) {
-            struct timespec now;
-            clock_gettime(CLOCK_MONOTONIC, &now);
-            int64_t now_ms = now.tv_sec * 1000LL + now.tv_nsec / 1000000LL;
+            int64_t now_ms = monotonic_now_ms();
             if (now_ms >= next_reopen_at_ms) {
                 if (reopen_touchpad(&tp, &min_x, &max_x, &min_y, &max_y) == 0) {
                     read_pressure_range(tp.dev, &pressure_min, &pressure_max);
