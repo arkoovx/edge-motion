@@ -4,6 +4,19 @@ set -euo pipefail
 UPDATE_ENV_FILE="${EDGE_MOTION_UPDATE_CONFIG:-/etc/default/edge-motion-update}"
 REPO_DIR="${EDGE_MOTION_REPO_DIR:-/opt/edge-motion-src}"
 BRANCH="${EDGE_MOTION_UPDATE_BRANCH:-main}"
+MANUAL_RUN=0
+
+if [[ -t 1 ]]; then
+  MANUAL_RUN=1
+fi
+
+status() {
+  local text="$1"
+  logger -t edge-motion-auto-update "$text"
+  if [[ "$MANUAL_RUN" == "1" ]]; then
+    echo "$text"
+  fi
+}
 
 if [[ -f "$UPDATE_ENV_FILE" ]]; then
   # shellcheck disable=SC1090
@@ -15,19 +28,22 @@ fi
 : "${EDGE_MOTION_UPDATE_BRANCH:=$BRANCH}"
 
 if [[ "$EDGE_MOTION_AUTO_UPDATE" != "1" ]]; then
+  status "Автообновление отключено в конфиге."
   exit 0
 fi
 
 if ! command -v git >/dev/null 2>&1 || ! command -v make >/dev/null 2>&1; then
+  status "Зависимости git/make не найдены, обновление пропущено."
   exit 0
 fi
 
 if [[ ! -d "$EDGE_MOTION_REPO_DIR/.git" ]]; then
+  status "Репозиторий не найден в $EDGE_MOTION_REPO_DIR, обновление пропущено."
   exit 0
 fi
 
 if ! git -C "$EDGE_MOTION_REPO_DIR" fetch origin "$EDGE_MOTION_UPDATE_BRANCH" --quiet; then
-  logger -t edge-motion-auto-update "fetch failed; skip update"
+  status "Не удалось выполнить fetch, обновление пропущено."
   exit 0
 fi
 
@@ -35,6 +51,7 @@ local_rev="$(git -C "$EDGE_MOTION_REPO_DIR" rev-parse HEAD)"
 remote_rev="$(git -C "$EDGE_MOTION_REPO_DIR" rev-parse "origin/$EDGE_MOTION_UPDATE_BRANCH")"
 
 if [[ "$local_rev" == "$remote_rev" ]]; then
+  status "Обновления не найдены (уже актуальная версия)."
   exit 0
 fi
 
@@ -43,18 +60,18 @@ cleanup() { rm -rf "$tmp_dir"; }
 trap cleanup EXIT
 
 if ! git -C "$EDGE_MOTION_REPO_DIR" worktree add --detach "$tmp_dir" "origin/$EDGE_MOTION_UPDATE_BRANCH" >/dev/null 2>&1; then
-  logger -t edge-motion-auto-update "cannot create worktree; skip"
+  status "Не удалось создать временный worktree, обновление пропущено."
   exit 0
 fi
 
 if make -C "$tmp_dir" deps-check >/dev/null 2>&1 && make -C "$tmp_dir" build >/dev/null 2>&1 && make -C "$tmp_dir" install >/dev/null 2>&1; then
   if git -C "$EDGE_MOTION_REPO_DIR" merge --ff-only "origin/$EDGE_MOTION_UPDATE_BRANCH" >/dev/null 2>&1; then
-    logger -t edge-motion-auto-update "updated to $remote_rev"
+    status "Успешно обновлено до $remote_rev."
   else
-    logger -t edge-motion-auto-update "build succeeded, but local repo wasn't fast-forwarded"
+    status "Сборка/установка успешна, но локальный репозиторий не был fast-forward."
   fi
 else
-  logger -t edge-motion-auto-update "update failed during build/install; keeping existing binary"
+  status "Ошибка во время сборки/установки обновления; текущая версия сохранена."
 fi
 
 git -C "$EDGE_MOTION_REPO_DIR" worktree remove "$tmp_dir" --force >/dev/null 2>&1 || true
