@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <errno.h>
+#include <ctype.h>
 #include <fcntl.h>
 #include <getopt.h>
 #include <libevdev/libevdev.h>
@@ -12,6 +13,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <strings.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <time.h>
@@ -39,7 +41,7 @@ static double max_speed = DEFAULT_MAX_SPEED;
 static int verbose = 0;
 static int list_devices = 0;
 static int use_grab = 1;
-static const char *forced_devnode = NULL;
+static char *forced_devnode = NULL;
 static int diagonal_scroll = 0;
 static int natural_scroll = 0;
 static int two_finger_scroll = 0;
@@ -197,6 +199,40 @@ static int parse_double_arg(const char *value, double *out)
     return 0;
 }
 
+static int parse_bool_arg(const char *value, int *out)
+{
+    if (!value)
+        return -1;
+
+    if (strcmp(value, "1") == 0 || strcasecmp(value, "true") == 0 ||
+        strcasecmp(value, "yes") == 0 || strcasecmp(value, "on") == 0) {
+        *out = 1;
+        return 0;
+    }
+
+    if (strcmp(value, "0") == 0 || strcasecmp(value, "false") == 0 ||
+        strcasecmp(value, "no") == 0 || strcasecmp(value, "off") == 0) {
+        *out = 0;
+        return 0;
+    }
+
+    return -1;
+}
+
+static int set_forced_devnode(const char *value)
+{
+    if (!value || value[0] != '/')
+        return -1;
+
+    char *copy = strdup(value);
+    if (!copy)
+        return -1;
+
+    free(forced_devnode);
+    forced_devnode = copy;
+    return 0;
+}
+
 static int apply_config_option(const char *key, const char *value)
 {
     if (strcmp(key, "threshold") == 0)
@@ -222,32 +258,25 @@ static int apply_config_option(const char *key, const char *value)
     if (strcmp(key, "mode") == 0)
         return parse_mode(value, &mode);
     if (strcmp(key, "natural-scroll") == 0) {
-        natural_scroll = atoi(value) != 0;
-        return 0;
+        return parse_bool_arg(value, &natural_scroll);
     }
     if (strcmp(key, "diagonal-scroll") == 0) {
-        diagonal_scroll = atoi(value) != 0;
-        return 0;
+        return parse_bool_arg(value, &diagonal_scroll);
     }
     if (strcmp(key, "two-finger-scroll") == 0) {
-        two_finger_scroll = atoi(value) != 0;
-        return 0;
+        return parse_bool_arg(value, &two_finger_scroll);
     }
     if (strcmp(key, "deadzone") == 0)
         return parse_double_arg(value, &deadzone);
     if (strcmp(key, "grab") == 0) {
-        use_grab = atoi(value) != 0;
-        return 0;
+        return parse_bool_arg(value, &use_grab);
     }
-    if (strcmp(key, "device") == 0) {
-        forced_devnode = strdup(value);
-        return forced_devnode ? 0 : -1;
-    }
+    if (strcmp(key, "device") == 0)
+        return set_forced_devnode(value);
     if (strcmp(key, "ignore") == 0)
         return add_ignored_devnode(value);
     if (strcmp(key, "daemon") == 0) {
-        daemon_mode = atoi(value) != 0;
-        return 0;
+        return parse_bool_arg(value, &daemon_mode);
     }
     if (strcmp(key, "scroll-axis-priority") == 0)
         return parse_scroll_priority(value, &scroll_priority);
@@ -270,7 +299,7 @@ static int load_config_file(const char *path)
     while (fgets(line, sizeof(line), fp)) {
         line_no++;
         char *p = line;
-        while (*p == ' ' || *p == '	')
+        while (*p && isspace((unsigned char)*p))
             p++;
         if (*p == '\0' || *p == '\n' || *p == '#')
             continue;
@@ -283,19 +312,18 @@ static int load_config_file(const char *path)
         char *value = eq + 1;
 
         char *kend = key + strlen(key);
-        while (kend > key && (kend[-1] == ' ' || kend[-1] == '	'))
+        while (kend > key && isspace((unsigned char)kend[-1]))
             *--kend = '\0';
-        while (*value == ' ' || *value == '	')
+        while (*value && isspace((unsigned char)*value))
             value++;
 
         char *vend = value + strlen(value);
-        while (vend > value &&
-               (vend[-1] == '\n' || vend[-1] == '\r' || vend[-1] == ' ' || vend[-1] == '	'))
-            fprintf(stderr, "Invalid config option at %s:%d -> %s\n", path, line_no, key);
+        while (vend > value && isspace((unsigned char)vend[-1]))
+            *--vend = '\0';
 
         if (apply_config_option(key, value) < 0) {
-            fprintf(stderr, "Invalid config option at %s:%d -> %s
-", path, line_no, key);
+            fprintf(stderr, "Invalid config option at %s:%d -> %s\n", path, line_no, key);
+            fflush(stderr);
             fclose(fp);
             return -1;
         }
@@ -526,6 +554,13 @@ static int enumerate_touchpad_candidates(struct touchpad_candidate **out_items, 
                             } else {
                                 free(devnode_copy);
                                 free(name_copy);
+                                free_touchpad_candidates(items, count);
+                                libevdev_free(evdev);
+                                close(fd);
+                                udev_device_unref(dev);
+                                udev_enumerate_unref(en);
+                                udev_unref(udev);
+                                return -1;
                             }
                         } else {
                             free(devnode_copy);
@@ -626,12 +661,15 @@ static int reopen_touchpad(struct touchpad_resources *tp,
     if (use_grab) {
         int grc = 0;
         int attempts = 3;
+        useconds_t delay_us = 10000;
         while (attempts-- > 0) {
             grc = libevdev_grab(tp->dev, LIBEVDEV_GRAB);
             if (grc == 0)
                 break;
-            if (attempts > 0)
-                usleep(10000);
+            if (attempts > 0) {
+                usleep(delay_us);
+                delay_us *= 2;
+            }
         }
         if (grc < 0 && verbose)
             fprintf(stderr, "Failed to grab touchpad: %s\n", strerror(-grc));
@@ -716,6 +754,13 @@ static void *pulser_thread(void *arg)
 
         int err = 0;
         if (edge_active && (dx || dy)) {
+            if (ufd < 0)
+                ufd = create_uinput_device();
+            if (ufd < 0) {
+                err = -1;
+                goto relock;
+            }
+
             double len = hypot((double)dx, (double)dy);
             if (len < 1e-9)
                 goto relock;
@@ -762,6 +807,11 @@ relock:
         if (err < 0) {
             if (verbose)
                 fprintf(stderr, "uinput write failed, disabling edge motion until recovery.\n");
+            if (ufd >= 0) {
+                ioctl(ufd, UI_DEV_DESTROY);
+                close(ufd);
+                ufd = -1;
+            }
             state.edge_active = 0;
             state.dir_x = 0;
             state.dir_y = 0;
@@ -776,6 +826,11 @@ relock:
         }
     }
     pthread_mutex_unlock(&state.lock);
+
+    if (ufd >= 0) {
+        ioctl(ufd, UI_DEV_DESTROY);
+        close(ufd);
+    }
 
     return NULL;
 }
@@ -984,7 +1039,10 @@ int main(int argc, char **argv)
             use_grab = 0;
             break;
         case 'd':
-            forced_devnode = optarg;
+            if (set_forced_devnode(optarg) < 0) {
+                fprintf(stderr, "Invalid device: %s\n", optarg);
+                return 2;
+            }
             break;
         case OPT_IGNORE:
             if (add_ignored_devnode(optarg) < 0) {
@@ -1030,7 +1088,7 @@ int main(int argc, char **argv)
         pulse_ms <= 0 || pulse_step <= 0 || max_speed < 1.0 || deadzone < 0.0 || deadzone >= 0.5 ||
         threshold_left < 0.01 || threshold_left > 0.5 || threshold_right < 0.01 ||
         threshold_right > 0.5 || threshold_top < 0.01 || threshold_top > 0.5 ||
-        threshold_bottom < 0.01 || threshold_bottom > 0.5 || accel_exponent < 1.0 ||
+        threshold_bottom < 0.01 || threshold_bottom > 0.5 || accel_exponent < 0.0 ||
         pressure_boost < 0.0 || pressure_boost > 2.0) {
         fprintf(stderr, "Invalid arguments. See --help.\n");
         return 2;
@@ -1043,7 +1101,8 @@ int main(int argc, char **argv)
     }
     if (deadzone + threshold_left > 0.5 || deadzone + threshold_right > 0.5 ||
         deadzone + threshold_top > 0.5 || deadzone + threshold_bottom > 0.5) {
-        fprintf(stderr, "deadzone + threshold(side) must not exceed 0.5\n");
+        fprintf(stderr,
+                "deadzone + threshold(side) must not exceed 0.5 for left/right/top/bottom\n");
         return 2;
     }
 
@@ -1200,7 +1259,7 @@ int main(int argc, char **argv)
                 depth_y = 1.0;
 
             speed_factor = fmax(depth_x, depth_y);
-            if (accel_exponent > 1.0)
+            if (accel_exponent != 1.0 && speed_factor > 0.0)
                 speed_factor = pow(speed_factor, accel_exponent);
             if (pressure_boost > 0.0 && pressure_max > pressure_min && last_pressure >= pressure_min) {
                 double p = (double)(last_pressure - pressure_min) / (double)(pressure_max - pressure_min);
@@ -1289,17 +1348,16 @@ int main(int argc, char **argv)
                         if (ev.code == ABS_MT_SLOT)
                             current_slot = ev.value;
 
-                        if (current_slot < 0 || current_slot >= slot_count)
-                            continue;
+                        int slot_valid = current_slot >= 0 && current_slot < slot_count;
 
-                        if (ev.code == ABS_MT_POSITION_X || ev.code == ABS_X) {
+                        if ((ev.code == ABS_MT_POSITION_X || ev.code == ABS_X) && slot_valid) {
                             slot_x[current_slot] = ev.value;
                             if (preferred_slot < 0 || preferred_slot == current_slot)
                                 preferred_slot = current_slot;
                             if (preferred_slot == current_slot && slot_y[current_slot] >= 0)
                                 last_x = ev.value;
                         }
-                        if (ev.code == ABS_MT_POSITION_Y || ev.code == ABS_Y) {
+                        if ((ev.code == ABS_MT_POSITION_Y || ev.code == ABS_Y) && slot_valid) {
                             slot_y[current_slot] = ev.value;
                             if (preferred_slot < 0 || preferred_slot == current_slot)
                                 preferred_slot = current_slot;
@@ -1310,7 +1368,7 @@ int main(int argc, char **argv)
                         if (ev.code == ABS_MT_PRESSURE || ev.code == ABS_PRESSURE)
                             last_pressure = ev.value;
 
-                        if (ev.code == ABS_MT_TRACKING_ID) {
+                        if (ev.code == ABS_MT_TRACKING_ID && slot_valid) {
                             if (ev.value == -1) {
                                 if (slot_active[current_slot] && active_fingers > 0)
                                     active_fingers--;
@@ -1443,7 +1501,7 @@ cleanup:
     if (thread_started)
         pthread_join(thr, NULL);
 
-    if (ufd >= 0) {
+    if (!thread_started && ufd >= 0) {
         ioctl(ufd, UI_DEV_DESTROY);
         close(ufd);
     }
@@ -1452,6 +1510,8 @@ cleanup:
     free(slot_x);
     free(slot_y);
     free(slot_active);
+    free(forced_devnode);
+    forced_devnode = NULL;
     free_ignored_devnodes();
 
     pthread_mutex_destroy(&state.lock);
