@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+TARGET_DIR="${1:-/opt/edge-motion-src}"
+BRANCH="${EDGE_MOTION_UPDATE_BRANCH:-main}"
+REPO_URL="${EDGE_MOTION_REPO_URL:-}"
+
+if [[ -z "$REPO_URL" ]]; then
+  if git -C "$(dirname "$0")/.." remote get-url origin >/dev/null 2>&1; then
+    REPO_URL="$(git -C "$(dirname "$0")/.." remote get-url origin)"
+  else
+    echo "Укажите URL репозитория через EDGE_MOTION_REPO_URL или настройте origin." >&2
+    exit 1
+  fi
+fi
+
+if [[ "$EUID" -ne 0 ]]; then
+  echo "Запустите скрипт с sudo/root." >&2
+  exit 1
+fi
+
+mkdir -p "$TARGET_DIR"
+if [[ ! -d "$TARGET_DIR/.git" ]]; then
+  rm -rf "$TARGET_DIR"
+  git clone --branch "$BRANCH" "$REPO_URL" "$TARGET_DIR"
+else
+  git -C "$TARGET_DIR" fetch origin "$BRANCH"
+  git -C "$TARGET_DIR" checkout "$BRANCH"
+  git -C "$TARGET_DIR" reset --hard "origin/$BRANCH"
+fi
+
+make -C "$TARGET_DIR" deps-check
+make -C "$TARGET_DIR" build
+make -C "$TARGET_DIR" install
+make -C "$TARGET_DIR" install-service
+
+echo "Готово: edge-motion собран и установлен из $TARGET_DIR"

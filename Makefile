@@ -34,7 +34,7 @@ build: deps-check
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(SRC) -o $(APP) $(LIBS) $(LDFLAGS)
 
 check:
-	bash -n scripts/edge-motion-config scripts/edge-motion-auto-update
+	bash -n scripts/edge-motion-config scripts/edge-motion-auto-update scripts/edge-motion-install-linux
 	@echo "Shell syntax check passed"
 
 update-now:
@@ -48,6 +48,7 @@ install: build
 	install -m 0755 $(APP) $(DESTDIR)$(BINDIR)/$(APP)
 	install -m 0755 scripts/edge-motion-config $(DESTDIR)$(BINDIR)/edge-motion-config
 	install -m 0755 scripts/edge-motion-auto-update $(DESTDIR)$(BINDIR)/edge-motion-auto-update
+	install -m 0755 scripts/edge-motion-install-linux $(DESTDIR)$(BINDIR)/edge-motion-install-linux
 
 install-config:
 	install -d $(DESTDIR)/etc/default
@@ -60,12 +61,14 @@ install-config:
 		echo 'EDGE_MOTION_AUTO_UPDATE=1' >> $(DESTDIR)/etc/default/edge-motion-update; \
 		echo 'EDGE_MOTION_REPO_DIR=/opt/edge-motion-src' >> $(DESTDIR)/etc/default/edge-motion-update; \
 		echo 'EDGE_MOTION_UPDATE_BRANCH=main' >> $(DESTDIR)/etc/default/edge-motion-update; \
+		echo 'EDGE_MOTION_REPO_SEARCH_PATHS=$$HOME/edge-motion:$$HOME/projects/edge-motion:$$HOME/src/edge-motion' >> $(DESTDIR)/etc/default/edge-motion-update; \
 	fi
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/$(APP)
 	rm -f $(DESTDIR)$(BINDIR)/edge-motion-config
 	rm -f $(DESTDIR)$(BINDIR)/edge-motion-auto-update
+	rm -f $(DESTDIR)$(BINDIR)/edge-motion-install-linux
 
 install-service: install install-config
 	install -d $(DESTDIR)$(UNITDIR)

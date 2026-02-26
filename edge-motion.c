@@ -16,11 +16,12 @@
 #include <strings.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/resource.h>
 #include <time.h>
 #include <libudev.h>
 #include <unistd.h>
 
-#define EDGE_MOTION_VERSION "1.2.0"
+#define EDGE_MOTION_VERSION "1.3.0"
 
 #define DEFAULT_EDGE_THRESHOLD 0.06
 #define DEFAULT_EDGE_HYSTERESIS 0.015
@@ -31,6 +32,10 @@
 #define TOUCHPAD_DISCONNECT_TIMEOUT_MS 200
 #define TOUCHPAD_REOPEN_POLL_MS 250
 #define UINPUT_SETTLE_MS 50
+#define RESOURCE_CHECK_INTERVAL_MS 1000
+#define DEFAULT_MAX_RSS_MB 256
+#define DEFAULT_MAX_CPU_PERCENT 90.0
+#define DEFAULT_RESOURCE_GRACE_CHECKS 5
 
 static double edge_threshold = DEFAULT_EDGE_THRESHOLD;
 static double edge_hysteresis = DEFAULT_EDGE_HYSTERESIS;
@@ -53,6 +58,10 @@ static double threshold_bottom = -1.0;
 static double accel_exponent = 1.0;
 static double pressure_boost = 0.0;
 static int daemon_mode = 0;
+static int resource_guard_enabled = 1;
+static int max_rss_mb = DEFAULT_MAX_RSS_MB;
+static double max_cpu_percent = DEFAULT_MAX_CPU_PERCENT;
+static int resource_grace_checks = DEFAULT_RESOURCE_GRACE_CHECKS;
 static char **ignored_devnodes = NULL;
 static size_t ignored_devnode_count = 0;
 
@@ -98,6 +107,15 @@ struct touchpad_candidate {
     int max_y;
     long long area;
 };
+
+struct resource_guard_state {
+    double last_cpu_seconds;
+    struct timespec last_ts;
+    int initialized;
+    int consecutive_over_limit;
+};
+
+static inline int64_t timespec_to_ms(const struct timespec *ts);
 
 static struct em_state state = {
     .lock = PTHREAD_MUTEX_INITIALIZER,
@@ -219,6 +237,118 @@ static int parse_bool_arg(const char *value, int *out)
     return -1;
 }
 
+static int read_rss_kb(void)
+{
+    FILE *fp = fopen("/proc/self/statm", "r");
+    if (!fp)
+        return -1;
+
+    unsigned long total_pages = 0;
+    unsigned long rss_pages = 0;
+    if (fscanf(fp, "%lu %lu", &total_pages, &rss_pages) != 2) {
+        fclose(fp);
+        return -1;
+    }
+    fclose(fp);
+    (void)total_pages;
+
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0)
+        return -1;
+
+    unsigned long long rss_bytes = (unsigned long long)rss_pages * (unsigned long long)page_size;
+    return (int)(rss_bytes / 1024ULL);
+}
+
+static double read_cpu_seconds(void)
+{
+    struct rusage usage;
+    if (getrusage(RUSAGE_SELF, &usage) != 0)
+        return -1.0;
+
+    double user = (double)usage.ru_utime.tv_sec + (double)usage.ru_utime.tv_usec / 1000000.0;
+    double sys = (double)usage.ru_stime.tv_sec + (double)usage.ru_stime.tv_usec / 1000000.0;
+    return user + sys;
+}
+
+static void maybe_show_resource_error_dialog(const char *message)
+{
+    const char *display = getenv("DISPLAY");
+    if (!display || !*display)
+        return;
+
+    pid_t pid = fork();
+    if (pid != 0)
+        return;
+
+    execlp("zenity", "zenity", "--error", "--title=edge-motion", "--width=520", "--text", message,
+           (char *)NULL);
+    _exit(0);
+}
+
+static int check_resource_limits(struct resource_guard_state *guard)
+{
+    if (!resource_guard_enabled)
+        return 0;
+
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (guard->initialized) {
+        int64_t elapsed_ms = timespec_to_ms(&now) - timespec_to_ms(&guard->last_ts);
+        if (elapsed_ms < RESOURCE_CHECK_INTERVAL_MS)
+            return 0;
+    }
+
+    int rss_kb = read_rss_kb();
+    double cpu_seconds = read_cpu_seconds();
+
+    if (!guard->initialized) {
+        guard->last_ts = now;
+        guard->last_cpu_seconds = cpu_seconds;
+        guard->initialized = 1;
+        guard->consecutive_over_limit = 0;
+        return 0;
+    }
+
+    double elapsed_s = (double)(timespec_to_ms(&now) - timespec_to_ms(&guard->last_ts)) / 1000.0;
+    if (elapsed_s < 0.001)
+        return 0;
+
+    double cpu_percent = 0.0;
+    if (cpu_seconds >= 0.0 && guard->last_cpu_seconds >= 0.0)
+        cpu_percent = (cpu_seconds - guard->last_cpu_seconds) / elapsed_s * 100.0;
+
+    guard->last_ts = now;
+    guard->last_cpu_seconds = cpu_seconds;
+
+    int rss_limit_kb = max_rss_mb > 0 ? max_rss_mb * 1024 : 0;
+    int rss_over = rss_limit_kb > 0 && rss_kb > 0 && rss_kb > rss_limit_kb;
+    int cpu_over = max_cpu_percent > 0.0 && cpu_percent > max_cpu_percent;
+
+    if (rss_over || cpu_over) {
+        guard->consecutive_over_limit++;
+        if (guard->consecutive_over_limit >= resource_grace_checks) {
+            char msg[512];
+            snprintf(msg,
+                     sizeof(msg),
+                     "edge-motion остановлен: повышенное потребление ресурсов.\n"
+                     "CPU: %.1f%% (лимит %.1f%%), RSS: %.1f MB (лимит %d MB).",
+                     cpu_percent,
+                     max_cpu_percent,
+                     rss_kb > 0 ? (double)rss_kb / 1024.0 : -1.0,
+                     max_rss_mb);
+            fprintf(stderr, "%s\n", msg);
+            maybe_show_resource_error_dialog(msg);
+            return -1;
+        }
+    } else {
+        guard->consecutive_over_limit = 0;
+    }
+
+    return 0;
+}
+
+
 static int set_forced_devnode(const char *value)
 {
     if (!value || value[0] != '/')
@@ -278,6 +408,14 @@ static int apply_config_option(const char *key, const char *value)
     if (strcmp(key, "daemon") == 0) {
         return parse_bool_arg(value, &daemon_mode);
     }
+    if (strcmp(key, "resource-guard") == 0)
+        return parse_bool_arg(value, &resource_guard_enabled);
+    if (strcmp(key, "max-rss-mb") == 0)
+        return parse_int_arg(value, &max_rss_mb);
+    if (strcmp(key, "max-cpu-percent") == 0)
+        return parse_double_arg(value, &max_cpu_percent);
+    if (strcmp(key, "resource-grace-checks") == 0)
+        return parse_int_arg(value, &resource_grace_checks);
     if (strcmp(key, "scroll-axis-priority") == 0)
         return parse_scroll_priority(value, &scroll_priority);
     if (strcmp(key, "accel-exponent") == 0)
@@ -865,6 +1003,11 @@ static void print_usage(const char *prog)
     printf("  --ignore </dev/input/eventX>  Ignore device (can be repeated)\n");
     printf("  --config <path>          Load config file with key=value lines\n");
     printf("  --daemon                 Run in daemon mode\n");
+    printf("  --resource-guard / --no-resource-guard  Enable/disable self-protection\n");
+    printf("  --max-rss-mb <n>         RSS memory limit in MB (default %d)\n", DEFAULT_MAX_RSS_MB);
+    printf("  --max-cpu-percent <n>    CPU usage limit in %% (default %.1f)\n", DEFAULT_MAX_CPU_PERCENT);
+    printf("  --resource-grace-checks <n> Consecutive checks above limits before stop (default %d)\n",
+           DEFAULT_RESOURCE_GRACE_CHECKS);
     printf("  --list-devices           Show available touchpads and exit\n");
     printf("  --version                Show version and exit\n");
     printf("  --verbose                Verbose logging\n");
@@ -882,6 +1025,11 @@ enum {
     OPT_IGNORE,
     OPT_DAEMON,
     OPT_CONFIG,
+    OPT_RESOURCE_GUARD,
+    OPT_NO_RESOURCE_GUARD,
+    OPT_MAX_RSS_MB,
+    OPT_MAX_CPU_PERCENT,
+    OPT_RESOURCE_GRACE_CHECKS,
 };
 
 int main(int argc, char **argv)
@@ -913,6 +1061,11 @@ int main(int argc, char **argv)
         {"ignore", required_argument, NULL, OPT_IGNORE},
         {"daemon", no_argument, NULL, OPT_DAEMON},
         {"config", required_argument, NULL, OPT_CONFIG},
+        {"resource-guard", no_argument, NULL, OPT_RESOURCE_GUARD},
+        {"no-resource-guard", no_argument, NULL, OPT_NO_RESOURCE_GUARD},
+        {"max-rss-mb", required_argument, NULL, OPT_MAX_RSS_MB},
+        {"max-cpu-percent", required_argument, NULL, OPT_MAX_CPU_PERCENT},
+        {"resource-grace-checks", required_argument, NULL, OPT_RESOURCE_GRACE_CHECKS},
         {"list-devices", no_argument, NULL, 'l'},
         {"version", no_argument, NULL, 'V'},
         {"verbose", no_argument, NULL, 'v'},
@@ -1057,6 +1210,30 @@ int main(int argc, char **argv)
             if (load_config_file(optarg) < 0)
                 return 2;
             break;
+        case OPT_RESOURCE_GUARD:
+            resource_guard_enabled = 1;
+            break;
+        case OPT_NO_RESOURCE_GUARD:
+            resource_guard_enabled = 0;
+            break;
+        case OPT_MAX_RSS_MB:
+            if (parse_int_arg(optarg, &max_rss_mb) < 0 || max_rss_mb < 0) {
+                fprintf(stderr, "Invalid max-rss-mb: %s\n", optarg);
+                return 2;
+            }
+            break;
+        case OPT_MAX_CPU_PERCENT:
+            if (parse_double_arg(optarg, &max_cpu_percent) < 0 || max_cpu_percent < 0.0) {
+                fprintf(stderr, "Invalid max-cpu-percent: %s\n", optarg);
+                return 2;
+            }
+            break;
+        case OPT_RESOURCE_GRACE_CHECKS:
+            if (parse_int_arg(optarg, &resource_grace_checks) < 0 || resource_grace_checks < 1) {
+                fprintf(stderr, "Invalid resource-grace-checks: %s\n", optarg);
+                return 2;
+            }
+            break;
         case 'l':
             list_devices = 1;
             break;
@@ -1089,7 +1266,8 @@ int main(int argc, char **argv)
         threshold_left < 0.01 || threshold_left > 0.5 || threshold_right < 0.01 ||
         threshold_right > 0.5 || threshold_top < 0.01 || threshold_top > 0.5 ||
         threshold_bottom < 0.01 || threshold_bottom > 0.5 || accel_exponent < 0.0 ||
-        pressure_boost < 0.0 || pressure_boost > 2.0) {
+        pressure_boost < 0.0 || pressure_boost > 2.0 || max_rss_mb < 0 || max_cpu_percent < 0.0 ||
+        resource_grace_checks < 1) {
         fprintf(stderr, "Invalid arguments. See --help.\n");
         return 2;
     }
@@ -1167,6 +1345,7 @@ int main(int argc, char **argv)
     int was_in_edge_y = 0;
     int touchpad_available = 1;
     int64_t next_reopen_at_ms = INT64_MAX;
+    struct resource_guard_state resource_guard = {0};
     int slot_count = 1;
     int active_fingers = 0;
     int pressure_min = 0, pressure_max = 0;
@@ -1184,6 +1363,11 @@ int main(int argc, char **argv)
     int read_flags = LIBEVDEV_READ_FLAG_NORMAL;
 
     while (running) {
+        if (check_resource_limits(&resource_guard) < 0) {
+            running = 0;
+            break;
+        }
+
         int should_active = 0;
         int dx = 0, dy = 0;
         int64_t edge_diff_ms = 0;
