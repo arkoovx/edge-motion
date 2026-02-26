@@ -102,6 +102,7 @@ journalctl -u edge-motion.service -f
 - `--diagonal-scroll` — разрешает одновременно горизонталь+вертикаль в scroll-режиме.
 - `--two-finger-scroll` — edge-scroll только при двух активных пальцах.
 - `--deadzone 0.08` — центральная зона, где edge-режим не активируется.
+- `--grab / --no-grab` — эксклюзивный захват тачпада (`--grab`) или совместный режим (`--no-grab`, по умолчанию).
 
 1. Меняйте **только один параметр за раз**.
 2. После изменения применяйте:
@@ -127,7 +128,7 @@ sudo /usr/local/bin/edge-motion --list-devices
 Если ваш тачпад есть в списке как `/dev/input/eventX`, задайте его явно в `ExecStart`:
 
 ```text
-ExecStart=/usr/local/bin/edge-motion --device /dev/input/eventX --threshold 0.06 --hold-ms 80 --pulse-ms 10 --pulse-step 3
+ExecStart=/usr/local/bin/edge-motion --device /dev/input/eventX --no-grab --threshold 0.06 --hold-ms 80 --pulse-ms 10 --pulse-step 3
 ```
 
 ---
@@ -171,12 +172,14 @@ gcc -O2 edge-motion.c -o edge-motion $(pkg-config --cflags --libs libevdev libud
 - **`Missing deps` при `make build`**  
   Не установлены dev-пакеты (`libevdev-dev`, `libudev-dev`, `pkg-config`).
 
+- **Edge-scroll работает, а остальная поверхность тачпада не работает**  
+  Обычно сервис запущен с `--grab`. Уберите `--grab` или добавьте `--no-grab` в `ExecStart`, затем выполните `sudo systemctl daemon-reload && sudo systemctl restart edge-motion.service`.
+
 - **`Не удалось создать uinput`**  
   Нужны права root (обычно запуск через systemd решает это).
 
 - **В CI/контейнере `apt update` даёт 403**  
   Это ограничение окружения, а не ошибка проекта.
-
 ---
 
 ## Лицензия

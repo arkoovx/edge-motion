@@ -40,7 +40,7 @@ static int pulse_step = DEFAULT_PULSE_STEP;
 static double max_speed = DEFAULT_MAX_SPEED;
 static int verbose = 0;
 static int list_devices = 0;
-static int use_grab = 1;
+static int use_grab = 0;
 static char *forced_devnode = NULL;
 static int diagonal_scroll = 0;
 static int natural_scroll = 0;
@@ -860,7 +860,7 @@ static void print_usage(const char *prog)
     printf("                           Scroll axis preference without diagonal mode\n");
     printf("  --accel-exponent <n>     Non-linear edge depth acceleration (default 1.0)\n");
     printf("  --pressure-boost <0-2>   Extra speed from touch pressure (default 0)\n");
-    printf("  --grab / --no-grab       Grab / do not grab touchpad\n");
+    printf("  --grab / --no-grab       Exclusive grab (can disable normal touchpad input) / shared mode\n");
     printf("  --device </dev/input/eventX>  Force touchpad device\n");
     printf("  --ignore </dev/input/eventX>  Ignore device (can be repeated)\n");
     printf("  --config <path>          Load config file with key=value lines\n");
