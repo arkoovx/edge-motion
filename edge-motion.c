@@ -484,9 +484,11 @@ int main(int argc, char **argv)
 cleanup:
     running = 0;
 
-    pthread_mutex_lock(&state.lock);
-    pthread_cond_broadcast(&state.cond);
-    pthread_mutex_unlock(&state.lock);
+    if (cond_initialized) {
+        pthread_mutex_lock(&state.lock);
+        pthread_cond_broadcast(&state.cond);
+        pthread_mutex_unlock(&state.lock);
+    }
 
     if (thread_started)
         pthread_join(thr, NULL);
