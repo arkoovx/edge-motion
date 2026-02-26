@@ -77,11 +77,26 @@ EDGE_MOTION_ARGS="..."
 EDGE_MOTION_AUTO_UPDATE=1
 EDGE_MOTION_REPO_DIR=/opt/edge-motion-src
 EDGE_MOTION_UPDATE_BRANCH=main
+EDGE_MOTION_REPO_SEARCH_PATHS=$HOME/edge-motion:$HOME/projects/edge-motion:$HOME/src/edge-motion
 ```
 
-Если репозиторий не найден — автообновление просто пропускается, установленная рабочая версия не ломается.
+Если репозиторий не найден в `/opt/edge-motion-src`, автообновление автоматически ищет проект в альтернативных путях (`EDGE_MOTION_REPO_SEARCH_PATHS`).
 
 ---
+
+
+### Защита от перегрузки ресурсов
+
+По умолчанию драйвер сам контролирует своё потребление ресурсов и аварийно останавливается при аномалиях, чтобы не «повесить» систему:
+
+```bash
+--resource-guard
+--max-rss-mb 256
+--max-cpu-percent 90
+--resource-grace-checks 5
+```
+
+При срабатывании защита пишет понятную ошибку в лог и пытается показать окно ошибки через `zenity` (если есть графическая сессия).
 
 ## Рекомендуемые стартовые профили
 
@@ -152,6 +167,17 @@ EDGE_MOTION_ARGS="--device /dev/input/eventX --no-grab --mode scroll --threshold
 Нужны root-права (через systemd сервис обычно всё корректно).
 
 ---
+
+
+### Автоустановка/сборка на Linux-ноутбуке
+
+Есть скрипт полного цикла (клонирование/обновление, сборка, установка бинарника и сервиса):
+
+```bash
+sudo EDGE_MOTION_REPO_URL=<url_репозитория> /usr/local/bin/edge-motion-install-linux /opt/edge-motion-src
+```
+
+Если `origin` уже настроен в локальном репозитории, `EDGE_MOTION_REPO_URL` можно не указывать.
 
 ## Диагностика
 

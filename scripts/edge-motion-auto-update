@@ -26,6 +26,7 @@ fi
 : "${EDGE_MOTION_AUTO_UPDATE:=1}"
 : "${EDGE_MOTION_REPO_DIR:=$REPO_DIR}"
 : "${EDGE_MOTION_UPDATE_BRANCH:=$BRANCH}"
+: "${EDGE_MOTION_REPO_SEARCH_PATHS:=}"
 
 if [[ "$EDGE_MOTION_AUTO_UPDATE" != "1" ]]; then
   status "Автообновление отключено в конфиге."
@@ -37,8 +38,47 @@ if ! command -v git >/dev/null 2>&1 || ! command -v make >/dev/null 2>&1; then
   exit 0
 fi
 
-if [[ ! -d "$EDGE_MOTION_REPO_DIR/.git" ]]; then
-  status "Репозиторий не найден в $EDGE_MOTION_REPO_DIR, обновление пропущено."
+is_repo_dir() {
+  local dir="$1"
+  [[ -n "$dir" && -d "$dir/.git" && -f "$dir/Makefile" && -f "$dir/edge-motion.c" ]]
+}
+
+find_repo_dir() {
+  local candidate
+
+  if is_repo_dir "$EDGE_MOTION_REPO_DIR"; then
+    printf '%s' "$EDGE_MOTION_REPO_DIR"
+    return 0
+  fi
+
+  local -a search_dirs=()
+  IFS=':' read -r -a user_paths <<<"$EDGE_MOTION_REPO_SEARCH_PATHS"
+  for candidate in "${user_paths[@]}"; do
+    [[ -n "$candidate" ]] && search_dirs+=("$candidate")
+  done
+
+  search_dirs+=(
+    "$PWD"
+    "$HOME/edge-motion"
+    "$HOME/projects/edge-motion"
+    "$HOME/src/edge-motion"
+    "/usr/local/src/edge-motion"
+    "/opt/edge-motion"
+  )
+
+  for candidate in "${search_dirs[@]}"; do
+    if is_repo_dir "$candidate"; then
+      status "Репозиторий найден в альтернативном пути: $candidate"
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+if ! EDGE_MOTION_REPO_DIR="$(find_repo_dir)"; then
+  status "Репозиторий не найден (включая /opt/edge-motion-src и альтернативные пути), обновление пропущено."
   exit 0
 fi
 
@@ -69,6 +109,18 @@ if make -C "$tmp_dir" deps-check >/dev/null 2>&1 && make -C "$tmp_dir" build >/d
     status "Успешно обновлено до $remote_rev."
   else
     status "Сборка/установка успешна, но локальный репозиторий не был fast-forward."
+  fi
+
+  status "Изменения в обновлении:"
+  git -C "$EDGE_MOTION_REPO_DIR" log --no-merges --pretty='- %s' "$local_rev..$remote_rev" | head -n 8 | while IFS= read -r line; do
+    status "$line"
+  done
+
+  if [[ -f "$tmp_dir/CHANGELOG.md" ]]; then
+    status "Пользовательские заметки к релизу:"
+    awk 'NR>1 && /^## / {exit} NR>1 {print}' "$tmp_dir/CHANGELOG.md" | sed '/^$/d' | head -n 10 | while IFS= read -r line; do
+      status "$line"
+    done
   fi
 else
   status "Ошибка во время сборки/установки обновления; текущая версия сохранена."
