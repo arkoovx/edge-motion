@@ -7,7 +7,7 @@ SRC := edge-motion.c
 CFLAGS ?= -O2
 LIBS := $(shell pkg-config --libs libevdev libudev 2>/dev/null)
 CPPFLAGS += $(shell pkg-config --cflags libevdev libudev 2>/dev/null)
-LDFLAGS += -pthread
+LDFLAGS += -pthread -lm
 
 .PHONY: help build clean install uninstall install-service uninstall-service deps-check
 
