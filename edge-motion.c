@@ -44,6 +44,15 @@ static int diagonal_scroll = 0;
 static int natural_scroll = 0;
 static int two_finger_scroll = 0;
 static double deadzone = 0.0;
+static double threshold_left = -1.0;
+static double threshold_right = -1.0;
+static double threshold_top = -1.0;
+static double threshold_bottom = -1.0;
+static double accel_exponent = 1.0;
+static double pressure_boost = 0.0;
+static int daemon_mode = 0;
+static char **ignored_devnodes = NULL;
+static size_t ignored_devnode_count = 0;
 
 enum em_mode {
     EM_MODE_MOTION = 0,
@@ -51,6 +60,14 @@ enum em_mode {
 };
 
 static enum em_mode mode = EM_MODE_MOTION;
+
+enum scroll_priority {
+    SCROLL_PRIORITY_DOMINANT = 0,
+    SCROLL_PRIORITY_HORIZONTAL = 1,
+    SCROLL_PRIORITY_VERTICAL = 2,
+};
+
+static enum scroll_priority scroll_priority = SCROLL_PRIORITY_DOMINANT;
 
 static volatile sig_atomic_t running = 1;
 
@@ -102,6 +119,62 @@ static int parse_mode(const char *value, enum em_mode *out)
     return -1;
 }
 
+static int parse_scroll_priority(const char *value, enum scroll_priority *out)
+{
+    if (strcmp(value, "dominant") == 0) {
+        *out = SCROLL_PRIORITY_DOMINANT;
+        return 0;
+    }
+    if (strcmp(value, "horizontal") == 0) {
+        *out = SCROLL_PRIORITY_HORIZONTAL;
+        return 0;
+    }
+    if (strcmp(value, "vertical") == 0) {
+        *out = SCROLL_PRIORITY_VERTICAL;
+        return 0;
+    }
+
+    return -1;
+}
+
+static int add_ignored_devnode(const char *value)
+{
+    if (!value || value[0] != '/')
+        return -1;
+
+    char *copy = strdup(value);
+    if (!copy)
+        return -1;
+
+    char **tmp = realloc(ignored_devnodes, (ignored_devnode_count + 1) * sizeof(*ignored_devnodes));
+    if (!tmp) {
+        free(copy);
+        return -1;
+    }
+
+    ignored_devnodes = tmp;
+    ignored_devnodes[ignored_devnode_count++] = copy;
+    return 0;
+}
+
+static int is_ignored_devnode(const char *devnode)
+{
+    for (size_t i = 0; i < ignored_devnode_count; i++) {
+        if (strcmp(ignored_devnodes[i], devnode) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+static void free_ignored_devnodes(void)
+{
+    for (size_t i = 0; i < ignored_devnode_count; i++)
+        free(ignored_devnodes[i]);
+    free(ignored_devnodes);
+    ignored_devnodes = NULL;
+    ignored_devnode_count = 0;
+}
+
 static int parse_int_arg(const char *value, int *out)
 {
     char *end = NULL;
@@ -121,6 +194,114 @@ static int parse_double_arg(const char *value, double *out)
     if (errno != 0 || !end || *end != '\0' || !isfinite(parsed))
         return -1;
     *out = parsed;
+    return 0;
+}
+
+static int apply_config_option(const char *key, const char *value)
+{
+    if (strcmp(key, "threshold") == 0)
+        return parse_double_arg(value, &edge_threshold);
+    if (strcmp(key, "threshold-left") == 0)
+        return parse_double_arg(value, &threshold_left);
+    if (strcmp(key, "threshold-right") == 0)
+        return parse_double_arg(value, &threshold_right);
+    if (strcmp(key, "threshold-top") == 0)
+        return parse_double_arg(value, &threshold_top);
+    if (strcmp(key, "threshold-bottom") == 0)
+        return parse_double_arg(value, &threshold_bottom);
+    if (strcmp(key, "hysteresis") == 0)
+        return parse_double_arg(value, &edge_hysteresis);
+    if (strcmp(key, "hold-ms") == 0)
+        return parse_int_arg(value, &hold_ms);
+    if (strcmp(key, "pulse-ms") == 0)
+        return parse_int_arg(value, &pulse_ms);
+    if (strcmp(key, "pulse-step") == 0)
+        return parse_int_arg(value, &pulse_step);
+    if (strcmp(key, "max-speed") == 0)
+        return parse_double_arg(value, &max_speed);
+    if (strcmp(key, "mode") == 0)
+        return parse_mode(value, &mode);
+    if (strcmp(key, "natural-scroll") == 0) {
+        natural_scroll = atoi(value) != 0;
+        return 0;
+    }
+    if (strcmp(key, "diagonal-scroll") == 0) {
+        diagonal_scroll = atoi(value) != 0;
+        return 0;
+    }
+    if (strcmp(key, "two-finger-scroll") == 0) {
+        two_finger_scroll = atoi(value) != 0;
+        return 0;
+    }
+    if (strcmp(key, "deadzone") == 0)
+        return parse_double_arg(value, &deadzone);
+    if (strcmp(key, "grab") == 0) {
+        use_grab = atoi(value) != 0;
+        return 0;
+    }
+    if (strcmp(key, "device") == 0) {
+        forced_devnode = strdup(value);
+        return forced_devnode ? 0 : -1;
+    }
+    if (strcmp(key, "ignore") == 0)
+        return add_ignored_devnode(value);
+    if (strcmp(key, "daemon") == 0) {
+        daemon_mode = atoi(value) != 0;
+        return 0;
+    }
+    if (strcmp(key, "scroll-axis-priority") == 0)
+        return parse_scroll_priority(value, &scroll_priority);
+    if (strcmp(key, "accel-exponent") == 0)
+        return parse_double_arg(value, &accel_exponent);
+    if (strcmp(key, "pressure-boost") == 0)
+        return parse_double_arg(value, &pressure_boost);
+
+    return -1;
+}
+
+static int load_config_file(const char *path)
+{
+    FILE *fp = fopen(path, "r");
+    if (!fp)
+        return -1;
+
+    char line[512];
+    int line_no = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        line_no++;
+        char *p = line;
+        while (*p == ' ' || *p == '	')
+            p++;
+        if (*p == '\0' || *p == '
+' || *p == '#')
+            continue;
+
+        char *eq = strchr(p, '=');
+        if (!eq)
+            continue;
+        *eq = '\0';
+        char *key = p;
+        char *value = eq + 1;
+
+        char *kend = key + strlen(key);
+        while (kend > key && (kend[-1] == ' ' || kend[-1] == '	'))
+            *--kend = '\0';
+        while (*value == ' ' || *value == '	')
+            value++;
+        char *vend = value + strlen(value);
+        while (vend > value && (vend[-1] == '
+' || vend[-1] == '' || vend[-1] == ' ' || vend[-1] == '	'))
+            *--vend = '\0';
+
+        if (apply_config_option(key, value) < 0) {
+            fprintf(stderr, "Invalid config option at %s:%d -> %s
+", path, line_no, key);
+            fclose(fp);
+            return -1;
+        }
+    }
+
+    fclose(fp);
     return 0;
 }
 
@@ -297,7 +478,7 @@ static int enumerate_touchpad_candidates(struct touchpad_candidate **out_items, 
             continue;
 
         const char *devnode = udev_device_get_devnode(dev);
-        if (devnode && strstr(devnode, "/event")) {
+        if (devnode && strstr(devnode, "/event") && !is_ignored_devnode(devnode)) {
             int fd = open(devnode, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
             if (fd >= 0) {
                 struct libevdev *evdev = NULL;
@@ -420,6 +601,8 @@ static int reopen_touchpad(struct touchpad_resources *tp,
     cleanup_touchpad_resources(tp);
 
     if (forced_devnode) {
+        if (is_ignored_devnode(forced_devnode))
+            return -1;
         tp->devnode = strdup(forced_devnode);
         if (!tp->devnode)
             return -1;
@@ -472,6 +655,21 @@ static int reopen_touchpad(struct touchpad_resources *tp,
     *max_y = absy->maximum;
 
     return 0;
+}
+
+static void read_pressure_range(struct libevdev *dev, int *min_pressure, int *max_pressure)
+{
+    const struct input_absinfo *pressure = libevdev_get_abs_info(dev, ABS_MT_PRESSURE);
+    if (!pressure)
+        pressure = libevdev_get_abs_info(dev, ABS_PRESSURE);
+
+    if (pressure && pressure->maximum > pressure->minimum) {
+        *min_pressure = pressure->minimum;
+        *max_pressure = pressure->maximum;
+    } else {
+        *min_pressure = 0;
+        *max_pressure = 0;
+    }
 }
 
 static void deactivate_edge_motion(void)
@@ -536,10 +734,17 @@ static void *pulser_thread(void *arg)
                 if (step_y)
                     err |= emit_rel(ufd, REL_Y, step_y);
             } else {
-                if (!diagonal_scroll && abs(step_x) >= abs(step_y))
-                    step_y = 0;
-                else if (!diagonal_scroll)
-                    step_x = 0;
+                if (!diagonal_scroll) {
+                    if (scroll_priority == SCROLL_PRIORITY_HORIZONTAL) {
+                        step_y = 0;
+                    } else if (scroll_priority == SCROLL_PRIORITY_VERTICAL) {
+                        step_x = 0;
+                    } else if (abs(step_x) >= abs(step_y)) {
+                        step_y = 0;
+                    } else {
+                        step_x = 0;
+                    }
+                }
 
                 if (step_x)
                     err |= emit_rel(ufd, REL_HWHEEL, step_x);
@@ -579,7 +784,12 @@ static void print_usage(const char *prog)
 {
     printf("edge-motion - edge-triggered touchpad helper\n\n");
     printf("Usage: %s [OPTIONS]\n", prog);
-    printf("  --threshold <0.01-0.5>   Edge threshold (default %.2f)\n", DEFAULT_EDGE_THRESHOLD);
+    printf("Loads ~/.config/edge-motion.conf automatically if present.\n");
+    printf("  --threshold <0.01-0.5>   Edge threshold for all sides (default %.2f)\n", DEFAULT_EDGE_THRESHOLD);
+    printf("  --threshold-left <0.01-0.5>   Left edge threshold override\n");
+    printf("  --threshold-right <0.01-0.5>  Right edge threshold override\n");
+    printf("  --threshold-top <0.01-0.5>    Top edge threshold override\n");
+    printf("  --threshold-bottom <0.01-0.5> Bottom edge threshold override\n");
     printf("  --hysteresis <0.0-0.2>   Edge hysteresis (default %.3f)\n", DEFAULT_EDGE_HYSTERESIS);
     printf("  --hold-ms <ms>           Hold delay before activation (default %d)\n", DEFAULT_HOLD_MS);
     printf("  --pulse-ms <ms>          Pulse interval (default %d)\n", DEFAULT_PULSE_MS);
@@ -591,19 +801,43 @@ static void print_usage(const char *prog)
     printf("  --diagonal-scroll        Allow diagonal scrolling\n");
     printf("  --two-finger-scroll      Require two fingers in scroll mode\n");
     printf("  --deadzone <0.0-0.49>    Central non-activation zone\n");
+    printf("  --scroll-axis-priority <dominant|horizontal|vertical>\n");
+    printf("                           Scroll axis preference without diagonal mode\n");
+    printf("  --accel-exponent <n>     Non-linear edge depth acceleration (default 1.0)\n");
+    printf("  --pressure-boost <0-2>   Extra speed from touch pressure (default 0)\n");
     printf("  --grab / --no-grab       Grab / do not grab touchpad\n");
     printf("  --device </dev/input/eventX>  Force touchpad device\n");
+    printf("  --ignore </dev/input/eventX>  Ignore device (can be repeated)\n");
+    printf("  --config <path>          Load config file with key=value lines\n");
+    printf("  --daemon                 Run in daemon mode\n");
     printf("  --list-devices           Show available touchpads and exit\n");
     printf("  --version                Show version and exit\n");
     printf("  --verbose                Verbose logging\n");
     printf("  --help                   Show this help\n");
 }
 
+enum {
+    OPT_THRESHOLD_LEFT = 1000,
+    OPT_THRESHOLD_RIGHT,
+    OPT_THRESHOLD_TOP,
+    OPT_THRESHOLD_BOTTOM,
+    OPT_SCROLL_AXIS_PRIORITY,
+    OPT_ACCEL_EXPONENT,
+    OPT_PRESSURE_BOOST,
+    OPT_IGNORE,
+    OPT_DAEMON,
+    OPT_CONFIG,
+};
+
 int main(int argc, char **argv)
 {
     static struct option long_opts[] = {
         {"help", no_argument, NULL, 'h'},
         {"threshold", required_argument, NULL, 't'},
+        {"threshold-left", required_argument, NULL, OPT_THRESHOLD_LEFT},
+        {"threshold-right", required_argument, NULL, OPT_THRESHOLD_RIGHT},
+        {"threshold-top", required_argument, NULL, OPT_THRESHOLD_TOP},
+        {"threshold-bottom", required_argument, NULL, OPT_THRESHOLD_BOTTOM},
         {"hysteresis", required_argument, NULL, 'y'},
         {"hold-ms", required_argument, NULL, 'H'},
         {"pulse-ms", required_argument, NULL, 'p'},
@@ -615,14 +849,27 @@ int main(int argc, char **argv)
         {"diagonal-scroll", no_argument, NULL, 'D'},
         {"two-finger-scroll", no_argument, NULL, '2'},
         {"deadzone", required_argument, NULL, 'z'},
+        {"scroll-axis-priority", required_argument, NULL, OPT_SCROLL_AXIS_PRIORITY},
+        {"accel-exponent", required_argument, NULL, OPT_ACCEL_EXPONENT},
+        {"pressure-boost", required_argument, NULL, OPT_PRESSURE_BOOST},
         {"grab", no_argument, NULL, 'g'},
         {"no-grab", no_argument, NULL, 'G'},
         {"device", required_argument, NULL, 'd'},
+        {"ignore", required_argument, NULL, OPT_IGNORE},
+        {"daemon", no_argument, NULL, OPT_DAEMON},
+        {"config", required_argument, NULL, OPT_CONFIG},
         {"list-devices", no_argument, NULL, 'l'},
         {"version", no_argument, NULL, 'V'},
         {"verbose", no_argument, NULL, 'v'},
         {0, 0, 0, 0},
     };
+
+    char default_config[512];
+    const char *home = getenv("HOME");
+    if (home) {
+        snprintf(default_config, sizeof(default_config), "%s/.config/edge-motion.conf", home);
+        (void)load_config_file(default_config);
+    }
 
     int opt;
     while ((opt = getopt_long(argc, argv, "", long_opts, NULL)) != -1) {
@@ -633,6 +880,30 @@ int main(int argc, char **argv)
         case 't':
             if (parse_double_arg(optarg, &edge_threshold) < 0) {
                 fprintf(stderr, "Invalid threshold: %s\n", optarg);
+                return 2;
+            }
+            break;
+        case OPT_THRESHOLD_LEFT:
+            if (parse_double_arg(optarg, &threshold_left) < 0) {
+                fprintf(stderr, "Invalid threshold-left: %s\n", optarg);
+                return 2;
+            }
+            break;
+        case OPT_THRESHOLD_RIGHT:
+            if (parse_double_arg(optarg, &threshold_right) < 0) {
+                fprintf(stderr, "Invalid threshold-right: %s\n", optarg);
+                return 2;
+            }
+            break;
+        case OPT_THRESHOLD_TOP:
+            if (parse_double_arg(optarg, &threshold_top) < 0) {
+                fprintf(stderr, "Invalid threshold-top: %s\n", optarg);
+                return 2;
+            }
+            break;
+        case OPT_THRESHOLD_BOTTOM:
+            if (parse_double_arg(optarg, &threshold_bottom) < 0) {
+                fprintf(stderr, "Invalid threshold-bottom: %s\n", optarg);
                 return 2;
             }
             break;
@@ -688,6 +959,24 @@ int main(int argc, char **argv)
                 return 2;
             }
             break;
+        case OPT_SCROLL_AXIS_PRIORITY:
+            if (parse_scroll_priority(optarg, &scroll_priority) < 0) {
+                fprintf(stderr, "Invalid scroll-axis-priority: %s\n", optarg);
+                return 2;
+            }
+            break;
+        case OPT_ACCEL_EXPONENT:
+            if (parse_double_arg(optarg, &accel_exponent) < 0) {
+                fprintf(stderr, "Invalid accel-exponent: %s\n", optarg);
+                return 2;
+            }
+            break;
+        case OPT_PRESSURE_BOOST:
+            if (parse_double_arg(optarg, &pressure_boost) < 0) {
+                fprintf(stderr, "Invalid pressure-boost: %s\n", optarg);
+                return 2;
+            }
+            break;
         case 'g':
             use_grab = 1;
             break;
@@ -696,6 +985,19 @@ int main(int argc, char **argv)
             break;
         case 'd':
             forced_devnode = optarg;
+            break;
+        case OPT_IGNORE:
+            if (add_ignored_devnode(optarg) < 0) {
+                fprintf(stderr, "Invalid ignore devnode: %s\n", optarg);
+                return 2;
+            }
+            break;
+        case OPT_DAEMON:
+            daemon_mode = 1;
+            break;
+        case OPT_CONFIG:
+            if (load_config_file(optarg) < 0)
+                return 2;
             break;
         case 'l':
             list_devices = 1;
@@ -715,20 +1017,44 @@ int main(int argc, char **argv)
     if (list_devices)
         return print_touchpad_devices() == 0 ? 0 : 1;
 
-    if (edge_threshold < 0.01 || edge_threshold > 0.5 || edge_hysteresis < 0.0 ||
-        edge_hysteresis >= edge_threshold || hold_ms < 0 || pulse_ms <= 0 || pulse_step <= 0 ||
-        max_speed < 1.0 || deadzone < 0.0 || deadzone >= 0.5) {
+    if (threshold_left < 0.0)
+        threshold_left = edge_threshold;
+    if (threshold_right < 0.0)
+        threshold_right = edge_threshold;
+    if (threshold_top < 0.0)
+        threshold_top = edge_threshold;
+    if (threshold_bottom < 0.0)
+        threshold_bottom = edge_threshold;
+
+    if (edge_threshold < 0.01 || edge_threshold > 0.5 || edge_hysteresis < 0.0 || hold_ms < 0 ||
+        pulse_ms <= 0 || pulse_step <= 0 || max_speed < 1.0 || deadzone < 0.0 || deadzone >= 0.5 ||
+        threshold_left < 0.01 || threshold_left > 0.5 || threshold_right < 0.01 ||
+        threshold_right > 0.5 || threshold_top < 0.01 || threshold_top > 0.5 ||
+        threshold_bottom < 0.01 || threshold_bottom > 0.5 || accel_exponent < 1.0 ||
+        pressure_boost < 0.0 || pressure_boost > 2.0) {
         fprintf(stderr, "Invalid arguments. See --help.\n");
         return 2;
     }
-    if (deadzone + edge_threshold > 0.5) {
-        fprintf(stderr, "deadzone + edge_threshold must not exceed 0.5\n");
+
+    double max_threshold = fmax(fmax(threshold_left, threshold_right), fmax(threshold_top, threshold_bottom));
+    if (edge_hysteresis >= max_threshold) {
+        fprintf(stderr, "hysteresis must be lower than every active threshold\n");
+        return 2;
+    }
+    if (deadzone + threshold_left > 0.5 || deadzone + threshold_right > 0.5 ||
+        deadzone + threshold_top > 0.5 || deadzone + threshold_bottom > 0.5) {
+        fprintf(stderr, "deadzone + threshold(side) must not exceed 0.5\n");
         return 2;
     }
 
     struct sigaction sa = {.sa_handler = handle_signal, .sa_flags = 0};
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
+
+    if (daemon_mode && daemon(0, 0) < 0) {
+        perror("daemon");
+        return 1;
+    }
 
     struct touchpad_resources tp = {
         .devnode = NULL,
@@ -784,7 +1110,11 @@ int main(int argc, char **argv)
     int64_t next_reopen_at_ms = INT64_MAX;
     int slot_count = 1;
     int active_fingers = 0;
+    int pressure_min = 0, pressure_max = 0;
+    int last_pressure = -1;
     struct timespec edge_enter_time = {0};
+
+    read_pressure_range(tp.dev, &pressure_min, &pressure_max);
 
     if (reset_multitouch_state(tp.dev, &slot_x, &slot_y, &slot_active, &slot_count) < 0) {
         fprintf(stderr, "Failed to allocate multitouch state memory.\n");
@@ -817,46 +1147,52 @@ int main(int argc, char **argv)
             double depth_x = 0.0;
             double depth_y = 0.0;
 
-            double enter_outer = edge_threshold;
-            double leave_inner = edge_threshold - edge_hysteresis;
+            double left_enter = threshold_left;
+            double right_enter = threshold_right;
+            double top_enter = threshold_top;
+            double bottom_enter = threshold_bottom;
+            double left_leave = left_enter - edge_hysteresis;
+            double right_leave = right_enter - edge_hysteresis;
+            double top_leave = top_enter - edge_hysteresis;
+            double bottom_leave = bottom_enter - edge_hysteresis;
 
             if (was_in_edge_x) {
-                if (nx >= 1.0 - leave_inner)
+                if (nx >= 1.0 - right_leave)
                     dx = 1;
-                else if (nx <= leave_inner)
+                else if (nx <= left_leave)
                     dx = -1;
             }
 
             if (!dx) {
-                if (nx >= 1.0 - enter_outer)
+                if (nx >= 1.0 - right_enter)
                     dx = 1;
-                else if (nx <= enter_outer)
+                else if (nx <= left_enter)
                     dx = -1;
             }
 
             if (was_in_edge_y) {
-                if (ny >= 1.0 - leave_inner)
+                if (ny >= 1.0 - bottom_leave)
                     dy = 1;
-                else if (ny <= leave_inner)
+                else if (ny <= top_leave)
                     dy = -1;
             }
 
             if (!dy) {
-                if (ny >= 1.0 - enter_outer)
+                if (ny >= 1.0 - bottom_enter)
                     dy = 1;
-                else if (ny <= enter_outer)
+                else if (ny <= top_enter)
                     dy = -1;
             }
 
-            if (nx >= 1.0 - edge_threshold)
-                depth_x = (nx - (1.0 - edge_threshold)) / edge_threshold;
-            else if (nx <= edge_threshold)
-                depth_x = (edge_threshold - nx) / edge_threshold;
+            if (nx >= 1.0 - right_enter)
+                depth_x = (nx - (1.0 - right_enter)) / right_enter;
+            else if (nx <= left_enter)
+                depth_x = (left_enter - nx) / left_enter;
 
-            if (ny >= 1.0 - edge_threshold)
-                depth_y = (ny - (1.0 - edge_threshold)) / edge_threshold;
-            else if (ny <= edge_threshold)
-                depth_y = (edge_threshold - ny) / edge_threshold;
+            if (ny >= 1.0 - bottom_enter)
+                depth_y = (ny - (1.0 - bottom_enter)) / bottom_enter;
+            else if (ny <= top_enter)
+                depth_y = (top_enter - ny) / top_enter;
 
             if (depth_x > 1.0)
                 depth_x = 1.0;
@@ -864,6 +1200,18 @@ int main(int argc, char **argv)
                 depth_y = 1.0;
 
             speed_factor = fmax(depth_x, depth_y);
+            if (accel_exponent > 1.0)
+                speed_factor = pow(speed_factor, accel_exponent);
+            if (pressure_boost > 0.0 && pressure_max > pressure_min && last_pressure >= pressure_min) {
+                double p = (double)(last_pressure - pressure_min) / (double)(pressure_max - pressure_min);
+                if (p < 0.0)
+                    p = 0.0;
+                if (p > 1.0)
+                    p = 1.0;
+                speed_factor *= 1.0 + p * pressure_boost;
+                if (speed_factor > 1.0)
+                    speed_factor = 1.0;
+            }
 
             int currently_in_edge = (dx != 0 || dy != 0);
             if (currently_in_edge) {
@@ -959,6 +1307,9 @@ int main(int argc, char **argv)
                                 last_y = ev.value;
                         }
 
+                        if (ev.code == ABS_MT_PRESSURE || ev.code == ABS_PRESSURE)
+                            last_pressure = ev.value;
+
                         if (ev.code == ABS_MT_TRACKING_ID) {
                             if (ev.value == -1) {
                                 if (slot_active[current_slot] && active_fingers > 0)
@@ -981,6 +1332,7 @@ int main(int argc, char **argv)
                                 ev.value == 0)) {
                         last_x = -1;
                         last_y = -1;
+                        last_pressure = -1;
                         was_in_edge = 0;
                         was_in_edge_x = 0;
                         was_in_edge_y = 0;
@@ -1047,6 +1399,8 @@ int main(int argc, char **argv)
             int64_t now_ms = now.tv_sec * 1000LL + now.tv_nsec / 1000000LL;
             if (now_ms >= next_reopen_at_ms) {
                 if (reopen_touchpad(&tp, &min_x, &max_x, &min_y, &max_y) == 0) {
+                    read_pressure_range(tp.dev, &pressure_min, &pressure_max);
+
                     if (reset_multitouch_state(tp.dev, &slot_x, &slot_y, &slot_active, &slot_count) < 0) {
                         fprintf(stderr, "Failed to refresh multitouch state after reconnect.\n");
                         running = 0;
@@ -1064,6 +1418,7 @@ int main(int argc, char **argv)
                     current_slot = 0;
                     preferred_slot = -1;
                     active_fingers = 0;
+                    last_pressure = -1;
                     last_x = -1;
                     last_y = -1;
                     was_in_edge = 0;
@@ -1097,6 +1452,7 @@ cleanup:
     free(slot_x);
     free(slot_y);
     free(slot_active);
+    free_ignored_devnodes();
 
     pthread_mutex_destroy(&state.lock);
     if (cond_initialized)
