@@ -17,6 +17,8 @@
 #include <libudev.h>
 #include <unistd.h>
 
+#define EDGE_MOTION_VERSION "1.1.0"
+
 #define DEFAULT_EDGE_THRESHOLD 0.06
 #define DEFAULT_EDGE_HYSTERESIS 0.015
 #define DEFAULT_HOLD_MS 80
@@ -37,6 +39,10 @@ static int verbose = 0;
 static int list_devices = 0;
 static int use_grab = 1;
 static const char *forced_devnode = NULL;
+static int diagonal_scroll = 0;
+static int natural_scroll = 0;
+static int two_finger_scroll = 0;
+static double deadzone = 0.0;
 
 enum em_mode {
     EM_MODE_MOTION = 0,
@@ -93,6 +99,28 @@ static int parse_mode(const char *value, enum em_mode *out)
     }
 
     return -1;
+}
+
+static int parse_int_arg(const char *value, int *out)
+{
+    char *end = NULL;
+    errno = 0;
+    long parsed = strtol(value, &end, 10);
+    if (errno != 0 || !end || *end != '\0' || parsed < INT32_MIN || parsed > INT32_MAX)
+        return -1;
+    *out = (int)parsed;
+    return 0;
+}
+
+static int parse_double_arg(const char *value, double *out)
+{
+    char *end = NULL;
+    errno = 0;
+    double parsed = strtod(value, &end);
+    if (errno != 0 || !end || *end != '\0' || !isfinite(parsed))
+        return -1;
+    *out = parsed;
+    return 0;
 }
 
 static void handle_signal(int sig)
@@ -285,35 +313,42 @@ static int enumerate_touchpad_candidates(struct touchpad_candidate **out_items, 
 
                     if (absx && absy && absx->maximum >= absx->minimum &&
                         absy->maximum >= absy->minimum) {
-                        struct touchpad_candidate *tmp =
-                            realloc(items, (count + 1) * sizeof(*items));
-                        if (tmp) {
-                            items = tmp;
-                            items[count].devnode = strdup(devnode);
-                            items[count].name =
-                                strdup(libevdev_get_name(evdev) ? libevdev_get_name(evdev)
-                                                                : "unknown");
-                            items[count].integrated =
-                                udev_device_get_property_value(dev,
-                                                               "ID_INPUT_TOUCHPAD_INTEGRATED") &&
-                                        strcmp(udev_device_get_property_value(
-                                                   dev, "ID_INPUT_TOUCHPAD_INTEGRATED"),
-                                               "1") == 0
-                                    ? 1
-                                    : 0;
-                            items[count].min_x = absx->minimum;
-                            items[count].max_x = absx->maximum;
-                            items[count].min_y = absy->minimum;
-                            items[count].max_y = absy->maximum;
-                            long long range_x = (long long)absx->maximum - (long long)absx->minimum;
-                            long long range_y = (long long)absy->maximum - (long long)absy->minimum;
-                            items[count].area = range_x * range_y;
-                            if (items[count].devnode && items[count].name)
+                        const char *device_name = libevdev_get_name(evdev) ? libevdev_get_name(evdev)
+                                                                          : "unknown";
+                        char *devnode_copy = strdup(devnode);
+                        char *name_copy = strdup(device_name);
+                        if (devnode_copy && name_copy) {
+                            struct touchpad_candidate *tmp =
+                                realloc(items, (count + 1) * sizeof(*items));
+                            if (tmp) {
+                                items = tmp;
+                                items[count].devnode = devnode_copy;
+                                items[count].name = name_copy;
+                                items[count].integrated =
+                                    udev_device_get_property_value(dev,
+                                                                   "ID_INPUT_TOUCHPAD_INTEGRATED") &&
+                                            strcmp(udev_device_get_property_value(
+                                                       dev, "ID_INPUT_TOUCHPAD_INTEGRATED"),
+                                                   "1") == 0
+                                        ? 1
+                                        : 0;
+                                items[count].min_x = absx->minimum;
+                                items[count].max_x = absx->maximum;
+                                items[count].min_y = absy->minimum;
+                                items[count].max_y = absy->maximum;
+                                long long range_x =
+                                    (long long)absx->maximum - (long long)absx->minimum;
+                                long long range_y =
+                                    (long long)absy->maximum - (long long)absy->minimum;
+                                items[count].area = range_x * range_y;
                                 count++;
-                            else {
-                                free(items[count].devnode);
-                                free(items[count].name);
+                            } else {
+                                free(devnode_copy);
+                                free(name_copy);
                             }
+                        } else {
+                            free(devnode_copy);
+                            free(name_copy);
                         }
                     }
                     libevdev_free(evdev);
@@ -338,7 +373,7 @@ static int print_touchpad_devices(void)
     struct touchpad_candidate *items = NULL;
     size_t count = 0;
     if (enumerate_touchpad_candidates(&items, &count) < 0) {
-        fprintf(stderr, "Не найдено подходящих touchpad-устройств.\n");
+        fprintf(stderr, "No suitable touchpad devices found.\n");
         return -1;
     }
 
@@ -384,10 +419,13 @@ static int reopen_touchpad(struct touchpad_resources *tp,
 {
     cleanup_touchpad_resources(tp);
 
-    if (forced_devnode)
+    if (forced_devnode) {
         tp->devnode = strdup(forced_devnode);
-    else
+        if (!tp->devnode)
+            return -1;
+    } else {
         tp->devnode = find_touchpad_devnode();
+    }
     if (!tp->devnode)
         return -1;
 
@@ -405,7 +443,7 @@ static int reopen_touchpad(struct touchpad_resources *tp,
     if (use_grab) {
         int grc = libevdev_grab(tp->dev, LIBEVDEV_GRAB);
         if (grc < 0 && verbose)
-            fprintf(stderr, "Не удалось сделать grab тачпада: %s\n", strerror(-grc));
+            fprintf(stderr, "Failed to grab touchpad: %s\n", strerror(-grc));
     }
 
     const struct input_absinfo *absx = libevdev_get_abs_info(tp->dev, ABS_MT_POSITION_X);
@@ -426,6 +464,17 @@ static int reopen_touchpad(struct touchpad_resources *tp,
     *max_y = absy->maximum;
 
     return 0;
+}
+
+static void deactivate_edge_motion(void)
+{
+    pthread_mutex_lock(&state.lock);
+    state.edge_active = 0;
+    state.dir_x = 0;
+    state.dir_y = 0;
+    state.speed_factor = 0.0;
+    pthread_cond_broadcast(&state.cond);
+    pthread_mutex_unlock(&state.lock);
 }
 
 static void get_timeout_timespec(struct timespec *ts, int ms)
@@ -458,42 +507,49 @@ static void *pulser_thread(void *arg)
         double speed_factor = state.speed_factor;
         pthread_mutex_unlock(&state.lock);
 
+        int err = 0;
         if (dx || dy) {
             double len = hypot((double)dx, (double)dy);
-            int current_step = (int)lround((double)pulse_step * (1.0 + speed_factor * (max_speed - 1.0)));
+            int current_step =
+                (int)lround((double)pulse_step * (1.0 + speed_factor * (max_speed - 1.0)));
             if (current_step < 1)
                 current_step = 1;
             int step_x = (int)lround((double)dx / len * (double)current_step);
             int step_y = (int)lround((double)dy / len * (double)current_step);
-            int err = 0;
+
             if (mode == EM_MODE_MOTION) {
                 if (step_x)
                     err |= emit_rel(ufd, REL_X, step_x);
                 if (step_y)
                     err |= emit_rel(ufd, REL_Y, step_y);
             } else {
+                if (!diagonal_scroll && abs(step_x) >= abs(step_y))
+                    step_y = 0;
+                else if (!diagonal_scroll)
+                    step_x = 0;
+
                 if (step_x)
                     err |= emit_rel(ufd, REL_HWHEEL, step_x);
                 if (step_y)
-                    err |= emit_rel(ufd, REL_WHEEL, -step_y);
+                    err |= emit_rel(ufd, REL_WHEEL, natural_scroll ? step_y : -step_y);
             }
             err |= emit_syn(ufd);
-
-            if (err < 0) {
-                if (verbose)
-                    fprintf(stderr, "Ошибка записи в uinput, останавливаюсь.\n");
-                pthread_mutex_lock(&state.lock);
-                running = 0;
-                state.edge_active = 0;
-                state.dir_x = 0;
-                state.dir_y = 0;
-                state.speed_factor = 0.0;
-                pthread_cond_broadcast(&state.cond);
-                break;
-            }
         }
 
         pthread_mutex_lock(&state.lock);
+        if (!running)
+            break;
+
+        if (err < 0) {
+            if (verbose)
+                fprintf(stderr, "uinput write failed, disabling edge motion until recovery.\n");
+            state.edge_active = 0;
+            state.dir_x = 0;
+            state.dir_y = 0;
+            state.speed_factor = 0.0;
+            pthread_cond_broadcast(&state.cond);
+        }
+
         if (running && state.edge_active) {
             struct timespec ts;
             get_timeout_timespec(&ts, pulse_ms);
@@ -507,20 +563,26 @@ static void *pulser_thread(void *arg)
 
 static void print_usage(const char *prog)
 {
-    printf("edge-motion — helper для edge scrolling на тачпаде\n\n");
+    printf("edge-motion - edge-triggered touchpad helper\n\n");
     printf("Usage: %s [OPTIONS]\n", prog);
-    printf("  --threshold <0.01-0.5>   Порог края (default %.2f)\n", DEFAULT_EDGE_THRESHOLD);
-    printf("  --hysteresis <0.0-0.2>   Гистерезис края (default %.3f)\n", DEFAULT_EDGE_HYSTERESIS);
-    printf("  --hold-ms <ms>           Задержка (default %d)\n", DEFAULT_HOLD_MS);
-    printf("  --pulse-ms <ms>          Интервал импульсов (default %d)\n", DEFAULT_PULSE_MS);
-    printf("  --pulse-step <n>         Скорость (default %d)\n", DEFAULT_PULSE_STEP);
-    printf("  --max-speed <n>          Максимальный множитель скорости (default %.1f)\n", DEFAULT_MAX_SPEED);
-    printf("  --mode <motion|scroll>   Режим: курсор или прокрутка\n");
-    printf("  --grab / --no-grab       Захватывать/не захватывать тачпад\n");
-    printf("  --device </dev/input/eventX>  Явно указать тачпад\n");
-    printf("  --list-devices           Показать доступные тачпады и выйти\n");
-    printf("  --verbose                Подробный вывод\n");
-    printf("  --help                   Эта справка\n");
+    printf("  --threshold <0.01-0.5>   Edge threshold (default %.2f)\n", DEFAULT_EDGE_THRESHOLD);
+    printf("  --hysteresis <0.0-0.2>   Edge hysteresis (default %.3f)\n", DEFAULT_EDGE_HYSTERESIS);
+    printf("  --hold-ms <ms>           Hold delay before activation (default %d)\n", DEFAULT_HOLD_MS);
+    printf("  --pulse-ms <ms>          Pulse interval (default %d)\n", DEFAULT_PULSE_MS);
+    printf("  --pulse-step <n>         Base movement step (default %d)\n", DEFAULT_PULSE_STEP);
+    printf("  --max-speed <n>          Max speed multiplier (default %.1f)\n", DEFAULT_MAX_SPEED);
+    printf("  --mode <motion|scroll>   Cursor motion or wheel scrolling\n");
+    printf("  --natural-scroll         Natural scroll direction\n");
+    printf("  --reverse-scroll         Alias for --natural-scroll\n");
+    printf("  --diagonal-scroll        Allow diagonal scrolling\n");
+    printf("  --two-finger-scroll      Require two fingers in scroll mode\n");
+    printf("  --deadzone <0.0-0.49>    Central non-activation zone\n");
+    printf("  --grab / --no-grab       Grab / do not grab touchpad\n");
+    printf("  --device </dev/input/eventX>  Force touchpad device\n");
+    printf("  --list-devices           Show available touchpads and exit\n");
+    printf("  --version                Show version and exit\n");
+    printf("  --verbose                Verbose logging\n");
+    printf("  --help                   Show this help\n");
 }
 
 int main(int argc, char **argv)
@@ -534,10 +596,16 @@ int main(int argc, char **argv)
         {"pulse-step", required_argument, NULL, 's'},
         {"max-speed", required_argument, NULL, 'm'},
         {"mode", required_argument, NULL, 'M'},
+        {"natural-scroll", no_argument, NULL, 'n'},
+        {"reverse-scroll", no_argument, NULL, 'r'},
+        {"diagonal-scroll", no_argument, NULL, 'D'},
+        {"two-finger-scroll", no_argument, NULL, '2'},
+        {"deadzone", required_argument, NULL, 'z'},
         {"grab", no_argument, NULL, 'g'},
         {"no-grab", no_argument, NULL, 'G'},
         {"device", required_argument, NULL, 'd'},
         {"list-devices", no_argument, NULL, 'l'},
+        {"version", no_argument, NULL, 'V'},
         {"verbose", no_argument, NULL, 'v'},
         {0, 0, 0, 0},
     };
@@ -549,26 +617,60 @@ int main(int argc, char **argv)
             print_usage(argv[0]);
             return 0;
         case 't':
-            edge_threshold = atof(optarg);
+            if (parse_double_arg(optarg, &edge_threshold) < 0) {
+                fprintf(stderr, "Invalid threshold: %s\n", optarg);
+                return 2;
+            }
             break;
         case 'y':
-            edge_hysteresis = atof(optarg);
+            if (parse_double_arg(optarg, &edge_hysteresis) < 0) {
+                fprintf(stderr, "Invalid hysteresis: %s\n", optarg);
+                return 2;
+            }
             break;
         case 'H':
-            hold_ms = atoi(optarg);
+            if (parse_int_arg(optarg, &hold_ms) < 0) {
+                fprintf(stderr, "Invalid hold-ms: %s\n", optarg);
+                return 2;
+            }
             break;
         case 'p':
-            pulse_ms = atoi(optarg);
+            if (parse_int_arg(optarg, &pulse_ms) < 0) {
+                fprintf(stderr, "Invalid pulse-ms: %s\n", optarg);
+                return 2;
+            }
             break;
         case 's':
-            pulse_step = atoi(optarg);
+            if (parse_int_arg(optarg, &pulse_step) < 0) {
+                fprintf(stderr, "Invalid pulse-step: %s\n", optarg);
+                return 2;
+            }
             break;
         case 'm':
-            max_speed = atof(optarg);
+            if (parse_double_arg(optarg, &max_speed) < 0) {
+                fprintf(stderr, "Invalid max-speed: %s\n", optarg);
+                return 2;
+            }
             break;
         case 'M':
             if (parse_mode(optarg, &mode) < 0) {
-                fprintf(stderr, "Некорректный режим: %s\n", optarg);
+                fprintf(stderr, "Invalid mode: %s\n", optarg);
+                return 2;
+            }
+            break;
+        case 'n':
+        case 'r':
+            natural_scroll = 1;
+            break;
+        case 'D':
+            diagonal_scroll = 1;
+            break;
+        case '2':
+            two_finger_scroll = 1;
+            break;
+        case 'z':
+            if (parse_double_arg(optarg, &deadzone) < 0) {
+                fprintf(stderr, "Invalid deadzone: %s\n", optarg);
                 return 2;
             }
             break;
@@ -584,6 +686,9 @@ int main(int argc, char **argv)
         case 'l':
             list_devices = 1;
             break;
+        case 'V':
+            printf("edge-motion %s\n", EDGE_MOTION_VERSION);
+            return 0;
         case 'v':
             verbose = 1;
             break;
@@ -598,8 +703,8 @@ int main(int argc, char **argv)
 
     if (edge_threshold < 0.01 || edge_threshold > 0.5 || edge_hysteresis < 0.0 ||
         edge_hysteresis >= edge_threshold || hold_ms < 0 || pulse_ms <= 0 || pulse_step <= 0 ||
-        max_speed < 1.0) {
-        fprintf(stderr, "Некорректные параметры. См. --help.\n");
+        max_speed < 1.0 || deadzone < 0.0 || deadzone >= 0.5) {
+        fprintf(stderr, "Invalid arguments. See --help.\n");
         return 2;
     }
 
@@ -620,7 +725,7 @@ int main(int argc, char **argv)
     unsigned char *slot_active = NULL;
 
     if (reopen_touchpad(&tp, &min_x, &max_x, &min_y, &max_y) < 0) {
-        fprintf(stderr, "Тачпад не найден.\n");
+        fprintf(stderr, "Touchpad not found.\n");
         return 1;
     }
 
@@ -628,7 +733,7 @@ int main(int argc, char **argv)
 
     int ufd = create_uinput_device();
     if (ufd < 0) {
-        fprintf(stderr, "Не удалось создать uinput (нужен root/cap_sys_admin).\n");
+        fprintf(stderr, "Failed to create uinput (requires root/cap_sys_admin).\n");
         goto cleanup;
     }
 
@@ -636,7 +741,7 @@ int main(int argc, char **argv)
     if (pthread_condattr_init(&cattr) != 0 ||
         pthread_condattr_setclock(&cattr, CLOCK_MONOTONIC) != 0 ||
         pthread_cond_init(&state.cond, &cattr) != 0) {
-        fprintf(stderr, "Не удалось инициализировать condition variable.\n");
+        fprintf(stderr, "Failed to initialize condition variable.\n");
         pthread_condattr_destroy(&cattr);
         goto cleanup;
     }
@@ -646,7 +751,7 @@ int main(int argc, char **argv)
     pthread_t thr;
     int thread_started = 0;
     if (pthread_create(&thr, NULL, pulser_thread, (void *)(intptr_t)ufd) != 0) {
-        fprintf(stderr, "Не удалось создать pulser thread.\n");
+        fprintf(stderr, "Failed to create pulser thread.\n");
         goto cleanup;
     }
     thread_started = 1;
@@ -660,10 +765,11 @@ int main(int argc, char **argv)
     int touchpad_available = 1;
     int64_t next_reopen_at_ms = 0;
     int slot_count = 1;
+    int active_fingers = 0;
     struct timespec edge_enter_time = {0};
 
     if (reset_multitouch_state(tp.dev, &slot_x, &slot_y, &slot_active, &slot_count) < 0) {
-        fprintf(stderr, "Не удалось выделить память под multitouch-состояние.\n");
+        fprintf(stderr, "Failed to allocate multitouch state memory.\n");
         goto cleanup;
     }
 
@@ -676,9 +782,14 @@ int main(int argc, char **argv)
         int64_t edge_diff_ms = 0;
 
         double speed_factor = 0.0;
-        if (last_x >= 0 && last_y >= 0 && max_x > min_x && max_y > min_y) {
+        int two_finger_ok = !(mode == EM_MODE_SCROLL && two_finger_scroll) || active_fingers >= 2;
+        if (last_x >= 0 && last_y >= 0 && max_x > min_x && max_y > min_y && two_finger_ok) {
             double nx = (double)(last_x - min_x) / (double)(max_x - min_x);
             double ny = (double)(last_y - min_y) / (double)(max_y - min_y);
+            if (nx > 0.5 - deadzone && nx < 0.5 + deadzone)
+                nx = 0.5;
+            if (ny > 0.5 - deadzone && ny < 0.5 + deadzone)
+                ny = 0.5;
             double depth_x = 0.0;
             double depth_y = 0.0;
 
@@ -777,7 +888,7 @@ int main(int argc, char **argv)
             timeout_ms = remaining > 0 ? (int)remaining : 0;
         }
 
-        int ret = touchpad_available ? poll(&pfd, 1, timeout_ms) : 0;
+        int ret = touchpad_available ? poll(&pfd, 1, timeout_ms) : poll(NULL, 0, timeout_ms);
         if (ret < 0) {
             if (errno == EINTR)
                 continue;
@@ -813,26 +924,36 @@ int main(int argc, char **argv)
                             slot_x[current_slot] = ev.value;
                             if (preferred_slot < 0 || preferred_slot == current_slot)
                                 preferred_slot = current_slot;
+                            if (preferred_slot == current_slot && slot_y[current_slot] >= 0)
+                                last_x = ev.value;
                         }
                         if (ev.code == ABS_MT_POSITION_Y || ev.code == ABS_Y) {
                             slot_y[current_slot] = ev.value;
                             if (preferred_slot < 0 || preferred_slot == current_slot)
                                 preferred_slot = current_slot;
+                            if (preferred_slot == current_slot && slot_x[current_slot] >= 0)
+                                last_y = ev.value;
                         }
 
                         if (ev.code == ABS_MT_TRACKING_ID) {
                             if (ev.value == -1) {
+                                if (slot_active[current_slot] && active_fingers > 0)
+                                    active_fingers--;
                                 slot_active[current_slot] = 0;
                                 slot_x[current_slot] = -1;
                                 slot_y[current_slot] = -1;
                                 if (preferred_slot == current_slot)
                                     preferred_slot = -1;
                             } else {
+                                if (!slot_active[current_slot])
+                                    active_fingers++;
                                 slot_active[current_slot] = 1;
+                                preferred_slot = current_slot;
                             }
                         }
                     } else if (ev.type == EV_KEY &&
-                               ((ev.code == BTN_TOUCH || ev.code == BTN_TOOL_FINGER) &&
+                               ((ev.code == BTN_TOUCH || ev.code == BTN_TOOL_FINGER ||
+                                 ev.code == BTN_TOOL_PEN || ev.code == BTN_TOOL_MOUSE) &&
                                 ev.value == 0)) {
                         last_x = -1;
                         last_y = -1;
@@ -840,6 +961,7 @@ int main(int argc, char **argv)
                         was_in_edge_x = 0;
                         was_in_edge_y = 0;
                         preferred_slot = -1;
+                        active_fingers = 0;
                         for (int i = 0; i < slot_count; i++) {
                             slot_active[i] = 0;
                             slot_x[i] = -1;
@@ -876,15 +998,9 @@ int main(int argc, char **argv)
             }
             if (rc < 0 && rc != -EAGAIN) {
                 if (verbose)
-                    fprintf(stderr, "Тачпад отключён, переподключаюсь...\n");
+                    fprintf(stderr, "Touchpad disconnected, reconnecting...\n");
 
-                pthread_mutex_lock(&state.lock);
-                state.edge_active = 0;
-                state.dir_x = 0;
-                state.dir_y = 0;
-                state.speed_factor = 0.0;
-                pthread_cond_signal(&state.cond);
-                pthread_mutex_unlock(&state.lock);
+                deactivate_edge_motion();
 
                 last_x = -1;
                 last_y = -1;
@@ -892,8 +1008,12 @@ int main(int argc, char **argv)
                 was_in_edge_x = 0;
                 was_in_edge_y = 0;
                 touchpad_available = 0;
+                active_fingers = 0;
                 cleanup_touchpad_resources(&tp);
                 pfd.fd = -1;
+                struct timespec now;
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                next_reopen_at_ms = timespec_to_ms(&now) + TOUCHPAD_DISCONNECT_TIMEOUT_MS;
             }
         }
 
@@ -904,13 +1024,13 @@ int main(int argc, char **argv)
             if (now_ms >= next_reopen_at_ms) {
                 if (reopen_touchpad(&tp, &min_x, &max_x, &min_y, &max_y) == 0) {
                     if (reset_multitouch_state(tp.dev, &slot_x, &slot_y, &slot_active, &slot_count) < 0) {
-                        fprintf(stderr, "Не удалось обновить multitouch-состояние после переподключения.\n");
+                        fprintf(stderr, "Failed to refresh multitouch state after reconnect.\n");
                         running = 0;
                         break;
                     }
 
                     if (verbose)
-                        fprintf(stderr, "Тачпад переподключён: %s\n", tp.devnode);
+                        fprintf(stderr, "Touchpad reconnected: %s\n", tp.devnode);
 
                     touchpad_available = 1;
                     pfd.fd = tp.input_fd;
@@ -919,6 +1039,7 @@ int main(int argc, char **argv)
                     read_flags = LIBEVDEV_READ_FLAG_NORMAL;
                     current_slot = 0;
                     preferred_slot = -1;
+                    active_fingers = 0;
                     last_x = -1;
                     last_y = -1;
                     was_in_edge = 0;
