@@ -27,6 +27,7 @@ static int hold_ms = DEFAULT_HOLD_MS;
 static int pulse_ms = DEFAULT_PULSE_MS;
 static int pulse_step = DEFAULT_PULSE_STEP;
 static int verbose = 0;
+static const char *forced_devnode = NULL;
 
 static volatile sig_atomic_t running = 1;
 
@@ -219,7 +220,10 @@ static int reopen_touchpad(struct touchpad_resources *tp,
 {
     cleanup_touchpad_resources(tp);
 
-    tp->devnode = find_touchpad_devnode();
+    if (forced_devnode)
+        tp->devnode = strdup(forced_devnode);
+    else
+        tp->devnode = find_touchpad_devnode();
     if (!tp->devnode)
         return -1;
 
@@ -265,12 +269,9 @@ static int reopen_touchpad(struct touchpad_resources *tp,
 static void get_timeout_timespec(struct timespec *ts, int ms)
 {
     clock_gettime(CLOCK_MONOTONIC, ts);
-    ts->tv_nsec += (ms % 1000) * 1000000L;
-    ts->tv_sec += ms / 1000;
-    if (ts->tv_nsec >= 1000000000L) {
-        ts->tv_sec += 1;
-        ts->tv_nsec -= 1000000000L;
-    }
+    int64_t nsec = ts->tv_nsec + (int64_t)(ms % 1000) * 1000000LL;
+    ts->tv_sec += ms / 1000 + (time_t)(nsec / 1000000000LL);
+    ts->tv_nsec = (long)(nsec % 1000000000LL);
 }
 
 static void *pulser_thread(void *arg)
@@ -301,6 +302,7 @@ static void *pulser_thread(void *arg)
                 if (verbose)
                     fprintf(stderr, "Ошибка записи в uinput, останавливаюсь.\n");
                 running = 0;
+                kill(getpid(), SIGTERM);
                 break;
             }
         }
@@ -325,6 +327,7 @@ static void print_usage(const char *prog)
     printf("  --hold-ms <ms>           Задержка (default %d)\n", DEFAULT_HOLD_MS);
     printf("  --pulse-ms <ms>          Интервал импульсов (default %d)\n", DEFAULT_PULSE_MS);
     printf("  --pulse-step <n>         Скорость (default %d)\n", DEFAULT_PULSE_STEP);
+    printf("  --device </dev/input/eventX>  Явно указать тачпад\n");
     printf("  --verbose                Подробный вывод\n");
     printf("  --help                   Эта справка\n");
 }
@@ -345,11 +348,13 @@ int main(int argc, char **argv)
             pulse_ms = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--pulse-step") && i + 1 < argc)
             pulse_step = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--device") && i + 1 < argc)
+            forced_devnode = argv[++i];
         else if (!strcmp(argv[i], "--verbose"))
             verbose = 1;
     }
 
-    struct sigaction sa = {.sa_handler = handle_signal, .sa_flags = SA_RESTART};
+    struct sigaction sa = {.sa_handler = handle_signal, .sa_flags = 0};
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
@@ -603,12 +608,9 @@ int main(int argc, char **argv)
                 if (reopen_touchpad(&tp, &min_x, &max_x, &min_y, &max_y, &bounce_thr_x,
                                     &bounce_thr_y) == 0) {
                     if (reset_multitouch_state(tp.dev, &slot_x, &slot_y, &slot_active, &slot_count) < 0) {
-                        if (verbose)
-                            fprintf(stderr, "Не удалось обновить multitouch-состояние после переподключения.\n");
-                        cleanup_touchpad_resources(&tp);
-                        pfd.fd = -1;
-                        next_reopen_at_ms = now_ms + TOUCHPAD_REOPEN_POLL_MS;
-                        continue;
+                        fprintf(stderr, "Не удалось обновить multitouch-состояние после переподключения.\n");
+                        running = 0;
+                        break;
                     }
 
                     if (verbose)
