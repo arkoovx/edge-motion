@@ -9,7 +9,7 @@ LIBS := $(shell pkg-config --libs libevdev libudev 2>/dev/null)
 CPPFLAGS += $(shell pkg-config --cflags libevdev libudev 2>/dev/null)
 LDFLAGS += -pthread -lm
 
-.PHONY: all help build clean install uninstall install-service uninstall-service deps-check install-config
+.PHONY: all help build clean install uninstall install-service uninstall-service deps-check install-config check
 
 all: build
 
@@ -22,6 +22,7 @@ help:
 	@echo "  make uninstall-service  Disable service and remove unit"
 	@echo "  make clean              Remove build artifacts"
 	@echo "  make deps-check         Check required dev packages via pkg-config"
+	@echo "  make check              Run lightweight syntax checks"
 
 deps-check:
 	@pkg-config --exists libevdev libudev || \
@@ -30,6 +31,10 @@ deps-check:
 
 build: deps-check
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(SRC) -o $(APP) $(LIBS) $(LDFLAGS)
+
+check:
+	bash -n scripts/edge-motion-config scripts/edge-motion-auto-update
+	@echo "Shell syntax check passed"
 
 clean:
 	rm -f $(APP)
@@ -59,7 +64,9 @@ uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/edge-motion-auto-update
 
 install-service: install install-config
-	install -m 0644 systemd/edge-motion.service $(DESTDIR)$(UNITDIR)/edge-motion.service
+	install -d $(DESTDIR)$(UNITDIR)
+	sed "s|@BINDIR@|$(BINDIR)|g" systemd/edge-motion.service > $(DESTDIR)$(UNITDIR)/edge-motion.service
+	chmod 0644 $(DESTDIR)$(UNITDIR)/edge-motion.service
 	@if command -v systemctl >/dev/null 2>&1; then \
 		systemctl daemon-reload; \
 		systemctl enable --now edge-motion.service; \
