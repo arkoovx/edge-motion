@@ -1,0 +1,13 @@
+[Unit]
+Description=Edge Motion Daemon (Touchpad edge scrolling)
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/edge-motion --threshold 0.06 --hold-ms 80 --pulse-ms 10 --pulse-step 3
+Restart=always
+RestartSec=2
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target
