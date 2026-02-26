@@ -38,7 +38,6 @@ struct em_state {
 
 static struct em_state state = {
     .lock = PTHREAD_MUTEX_INITIALIZER,
-    .cond = PTHREAD_COND_INITIALIZER,
     .edge_active = 0,
     .dir_x = 0,
     .dir_y = 0,
@@ -303,6 +302,8 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    int cond_initialized = 0;
+
     int ufd = create_uinput_device();
     if (ufd < 0) {
         fprintf(stderr, "Не удалось создать uinput (нужен root/cap_sys_admin).\n");
@@ -310,10 +311,15 @@ int main(int argc, char **argv)
     }
 
     pthread_condattr_t cattr;
-    pthread_condattr_init(&cattr);
-    pthread_condattr_setclock(&cattr, CLOCK_MONOTONIC);
-    pthread_cond_init(&state.cond, &cattr);
+    if (pthread_condattr_init(&cattr) != 0 ||
+        pthread_condattr_setclock(&cattr, CLOCK_MONOTONIC) != 0 ||
+        pthread_cond_init(&state.cond, &cattr) != 0) {
+        fprintf(stderr, "Не удалось инициализировать condition variable.\n");
+        pthread_condattr_destroy(&cattr);
+        goto cleanup;
+    }
     pthread_condattr_destroy(&cattr);
+    cond_initialized = 1;
 
     pthread_t thr;
     int thread_started = 0;
@@ -498,7 +504,8 @@ cleanup:
         free(devnode);
 
     pthread_mutex_destroy(&state.lock);
-    pthread_cond_destroy(&state.cond);
+    if (cond_initialized)
+        pthread_cond_destroy(&state.cond);
 
     return 0;
 }
