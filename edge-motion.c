@@ -18,20 +18,32 @@
 #include <unistd.h>
 
 #define DEFAULT_EDGE_THRESHOLD 0.06
+#define DEFAULT_EDGE_HYSTERESIS 0.015
 #define DEFAULT_HOLD_MS 80
 #define DEFAULT_PULSE_MS 10
 #define DEFAULT_PULSE_STEP 3
+#define DEFAULT_MAX_SPEED 3.0
 #define TOUCHPAD_DISCONNECT_TIMEOUT_MS 200
 #define TOUCHPAD_REOPEN_POLL_MS 250
 #define UINPUT_SETTLE_MS 50
 
 static double edge_threshold = DEFAULT_EDGE_THRESHOLD;
+static double edge_hysteresis = DEFAULT_EDGE_HYSTERESIS;
 static int hold_ms = DEFAULT_HOLD_MS;
 static int pulse_ms = DEFAULT_PULSE_MS;
 static int pulse_step = DEFAULT_PULSE_STEP;
+static double max_speed = DEFAULT_MAX_SPEED;
 static int verbose = 0;
 static int list_devices = 0;
+static int use_grab = 1;
 static const char *forced_devnode = NULL;
+
+enum em_mode {
+    EM_MODE_MOTION = 0,
+    EM_MODE_SCROLL = 1,
+};
+
+static enum em_mode mode = EM_MODE_MOTION;
 
 static volatile sig_atomic_t running = 1;
 
@@ -41,6 +53,7 @@ struct em_state {
     int edge_active;
     int dir_x;
     int dir_y;
+    double speed_factor;
 };
 
 struct touchpad_resources {
@@ -65,7 +78,22 @@ static struct em_state state = {
     .edge_active = 0,
     .dir_x = 0,
     .dir_y = 0,
+    .speed_factor = 0.0,
 };
+
+static int parse_mode(const char *value, enum em_mode *out)
+{
+    if (strcmp(value, "motion") == 0) {
+        *out = EM_MODE_MOTION;
+        return 0;
+    }
+    if (strcmp(value, "scroll") == 0) {
+        *out = EM_MODE_SCROLL;
+        return 0;
+    }
+
+    return -1;
+}
 
 static void handle_signal(int sig)
 {
@@ -73,31 +101,44 @@ static void handle_signal(int sig)
     running = 0;
 }
 
-static inline int emit_rel(int ufd, int code, int val)
+static inline int emit_event(int ufd, int type, int code, int val)
 {
     struct input_event ev = {0};
-    ev.type = EV_REL;
+    ev.type = type;
     ev.code = code;
     ev.value = val;
-    ssize_t ret;
-    do {
-        ret = write(ufd, &ev, sizeof(ev));
-    } while (ret < 0 && errno == EINTR);
+    size_t written = 0;
 
-    return ret == (ssize_t)sizeof(ev) ? 0 : -1;
+    while (written < sizeof(ev)) {
+        ssize_t ret = write(ufd, (const char *)&ev + written, sizeof(ev) - written);
+        if (ret > 0) {
+            written += (size_t)ret;
+            continue;
+        }
+
+        if (ret < 0 && errno == EINTR)
+            continue;
+
+        if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            struct timespec ts = {.tv_sec = 0, .tv_nsec = 1000000};
+            nanosleep(&ts, NULL);
+            continue;
+        }
+
+        return -1;
+    }
+
+    return 0;
+}
+
+static inline int emit_rel(int ufd, int code, int val)
+{
+    return emit_event(ufd, EV_REL, code, val);
 }
 
 static inline int emit_syn(int ufd)
 {
-    struct input_event ev = {0};
-    ev.type = EV_SYN;
-    ev.code = SYN_REPORT;
-    ssize_t ret;
-    do {
-        ret = write(ufd, &ev, sizeof(ev));
-    } while (ret < 0 && errno == EINTR);
-
-    return ret == (ssize_t)sizeof(ev) ? 0 : -1;
+    return emit_event(ufd, EV_SYN, SYN_REPORT, 0);
 }
 
 static inline int64_t timespec_to_ms(const struct timespec *ts)
@@ -169,7 +210,8 @@ static int create_uinput_device(void)
 
     if (ioctl(fd, UI_SET_EVBIT, EV_KEY) < 0 || ioctl(fd, UI_SET_KEYBIT, BTN_LEFT) < 0 ||
         ioctl(fd, UI_SET_KEYBIT, BTN_RIGHT) < 0 || ioctl(fd, UI_SET_EVBIT, EV_REL) < 0 ||
-        ioctl(fd, UI_SET_RELBIT, REL_X) < 0 || ioctl(fd, UI_SET_RELBIT, REL_Y) < 0) {
+        ioctl(fd, UI_SET_RELBIT, REL_X) < 0 || ioctl(fd, UI_SET_RELBIT, REL_Y) < 0 ||
+        ioctl(fd, UI_SET_RELBIT, REL_WHEEL) < 0 || ioctl(fd, UI_SET_RELBIT, REL_HWHEEL) < 0) {
         close(fd);
         return -1;
     }
@@ -182,6 +224,7 @@ static int create_uinput_device(void)
     uset.id.version = 1;
 
     if (ioctl(fd, UI_DEV_SETUP, &uset) < 0 || ioctl(fd, UI_DEV_CREATE) < 0) {
+        ioctl(fd, UI_DEV_DESTROY);
         close(fd);
         return -1;
     }
@@ -359,6 +402,12 @@ static int reopen_touchpad(struct touchpad_resources *tp,
         return -1;
     }
 
+    if (use_grab) {
+        int grc = libevdev_grab(tp->dev, LIBEVDEV_GRAB);
+        if (grc < 0 && verbose)
+            fprintf(stderr, "Не удалось сделать grab тачпада: %s\n", strerror(-grc));
+    }
+
     const struct input_absinfo *absx = libevdev_get_abs_info(tp->dev, ABS_MT_POSITION_X);
     if (!absx)
         absx = libevdev_get_abs_info(tp->dev, ABS_X);
@@ -381,9 +430,14 @@ static int reopen_touchpad(struct touchpad_resources *tp,
 
 static void get_timeout_timespec(struct timespec *ts, int ms)
 {
+    if (ms < 0)
+        ms = 0;
+
     clock_gettime(CLOCK_MONOTONIC, ts);
-    int64_t nsec = ts->tv_nsec + (int64_t)(ms % 1000) * 1000000LL;
-    ts->tv_sec += ms / 1000 + (time_t)(nsec / 1000000000LL);
+    int64_t sec_add = ms / 1000;
+    int64_t msec_add = ms % 1000;
+    int64_t nsec = (int64_t)ts->tv_nsec + msec_add * 1000000LL;
+    ts->tv_sec += (time_t)sec_add + (time_t)(nsec / 1000000000LL);
     ts->tv_nsec = (long)(nsec % 1000000000LL);
 }
 
@@ -401,17 +455,28 @@ static void *pulser_thread(void *arg)
 
         int dx = state.dir_x;
         int dy = state.dir_y;
+        double speed_factor = state.speed_factor;
         pthread_mutex_unlock(&state.lock);
 
         if (dx || dy) {
             double len = hypot((double)dx, (double)dy);
-            int step_x = (int)lround((double)dx / len * (double)pulse_step);
-            int step_y = (int)lround((double)dy / len * (double)pulse_step);
+            int current_step = (int)lround((double)pulse_step * (1.0 + speed_factor * (max_speed - 1.0)));
+            if (current_step < 1)
+                current_step = 1;
+            int step_x = (int)lround((double)dx / len * (double)current_step);
+            int step_y = (int)lround((double)dy / len * (double)current_step);
             int err = 0;
-            if (step_x)
-                err |= emit_rel(ufd, REL_X, step_x);
-            if (step_y)
-                err |= emit_rel(ufd, REL_Y, step_y);
+            if (mode == EM_MODE_MOTION) {
+                if (step_x)
+                    err |= emit_rel(ufd, REL_X, step_x);
+                if (step_y)
+                    err |= emit_rel(ufd, REL_Y, step_y);
+            } else {
+                if (step_x)
+                    err |= emit_rel(ufd, REL_HWHEEL, step_x);
+                if (step_y)
+                    err |= emit_rel(ufd, REL_WHEEL, -step_y);
+            }
             err |= emit_syn(ufd);
 
             if (err < 0) {
@@ -422,6 +487,7 @@ static void *pulser_thread(void *arg)
                 state.edge_active = 0;
                 state.dir_x = 0;
                 state.dir_y = 0;
+                state.speed_factor = 0.0;
                 pthread_cond_broadcast(&state.cond);
                 break;
             }
@@ -444,9 +510,13 @@ static void print_usage(const char *prog)
     printf("edge-motion — helper для edge scrolling на тачпаде\n\n");
     printf("Usage: %s [OPTIONS]\n", prog);
     printf("  --threshold <0.01-0.5>   Порог края (default %.2f)\n", DEFAULT_EDGE_THRESHOLD);
+    printf("  --hysteresis <0.0-0.2>   Гистерезис края (default %.3f)\n", DEFAULT_EDGE_HYSTERESIS);
     printf("  --hold-ms <ms>           Задержка (default %d)\n", DEFAULT_HOLD_MS);
     printf("  --pulse-ms <ms>          Интервал импульсов (default %d)\n", DEFAULT_PULSE_MS);
     printf("  --pulse-step <n>         Скорость (default %d)\n", DEFAULT_PULSE_STEP);
+    printf("  --max-speed <n>          Максимальный множитель скорости (default %.1f)\n", DEFAULT_MAX_SPEED);
+    printf("  --mode <motion|scroll>   Режим: курсор или прокрутка\n");
+    printf("  --grab / --no-grab       Захватывать/не захватывать тачпад\n");
     printf("  --device </dev/input/eventX>  Явно указать тачпад\n");
     printf("  --list-devices           Показать доступные тачпады и выйти\n");
     printf("  --verbose                Подробный вывод\n");
@@ -458,9 +528,14 @@ int main(int argc, char **argv)
     static struct option long_opts[] = {
         {"help", no_argument, NULL, 'h'},
         {"threshold", required_argument, NULL, 't'},
+        {"hysteresis", required_argument, NULL, 'y'},
         {"hold-ms", required_argument, NULL, 'H'},
         {"pulse-ms", required_argument, NULL, 'p'},
         {"pulse-step", required_argument, NULL, 's'},
+        {"max-speed", required_argument, NULL, 'm'},
+        {"mode", required_argument, NULL, 'M'},
+        {"grab", no_argument, NULL, 'g'},
+        {"no-grab", no_argument, NULL, 'G'},
         {"device", required_argument, NULL, 'd'},
         {"list-devices", no_argument, NULL, 'l'},
         {"verbose", no_argument, NULL, 'v'},
@@ -476,6 +551,9 @@ int main(int argc, char **argv)
         case 't':
             edge_threshold = atof(optarg);
             break;
+        case 'y':
+            edge_hysteresis = atof(optarg);
+            break;
         case 'H':
             hold_ms = atoi(optarg);
             break;
@@ -484,6 +562,21 @@ int main(int argc, char **argv)
             break;
         case 's':
             pulse_step = atoi(optarg);
+            break;
+        case 'm':
+            max_speed = atof(optarg);
+            break;
+        case 'M':
+            if (parse_mode(optarg, &mode) < 0) {
+                fprintf(stderr, "Некорректный режим: %s\n", optarg);
+                return 2;
+            }
+            break;
+        case 'g':
+            use_grab = 1;
+            break;
+        case 'G':
+            use_grab = 0;
             break;
         case 'd':
             forced_devnode = optarg;
@@ -503,8 +596,9 @@ int main(int argc, char **argv)
     if (list_devices)
         return print_touchpad_devices() == 0 ? 0 : 1;
 
-    if (edge_threshold < 0.01 || edge_threshold > 0.5 || hold_ms < 0 || pulse_ms <= 0 ||
-        pulse_step <= 0) {
+    if (edge_threshold < 0.01 || edge_threshold > 0.5 || edge_hysteresis < 0.0 ||
+        edge_hysteresis >= edge_threshold || hold_ms < 0 || pulse_ms <= 0 || pulse_step <= 0 ||
+        max_speed < 1.0) {
         fprintf(stderr, "Некорректные параметры. См. --help.\n");
         return 2;
     }
@@ -561,6 +655,8 @@ int main(int argc, char **argv)
     int current_slot = 0;
     int preferred_slot = -1;
     int was_in_edge = 0;
+    int was_in_edge_x = 0;
+    int was_in_edge_y = 0;
     int touchpad_available = 1;
     int64_t next_reopen_at_ms = 0;
     int slot_count = 1;
@@ -579,19 +675,60 @@ int main(int argc, char **argv)
         int dx = 0, dy = 0;
         int64_t edge_diff_ms = 0;
 
+        double speed_factor = 0.0;
         if (last_x >= 0 && last_y >= 0 && max_x > min_x && max_y > min_y) {
             double nx = (double)(last_x - min_x) / (double)(max_x - min_x);
             double ny = (double)(last_y - min_y) / (double)(max_y - min_y);
+            double depth_x = 0.0;
+            double depth_y = 0.0;
+
+            double enter_outer = edge_threshold;
+            double leave_inner = edge_threshold - edge_hysteresis;
+
+            if (was_in_edge_x) {
+                if (nx >= 1.0 - leave_inner)
+                    dx = 1;
+                else if (nx <= leave_inner)
+                    dx = -1;
+            }
+
+            if (!dx) {
+                if (nx >= 1.0 - enter_outer)
+                    dx = 1;
+                else if (nx <= enter_outer)
+                    dx = -1;
+            }
+
+            if (was_in_edge_y) {
+                if (ny >= 1.0 - leave_inner)
+                    dy = 1;
+                else if (ny <= leave_inner)
+                    dy = -1;
+            }
+
+            if (!dy) {
+                if (ny >= 1.0 - enter_outer)
+                    dy = 1;
+                else if (ny <= enter_outer)
+                    dy = -1;
+            }
 
             if (nx >= 1.0 - edge_threshold)
-                dx = 1;
+                depth_x = (nx - (1.0 - edge_threshold)) / edge_threshold;
             else if (nx <= edge_threshold)
-                dx = -1;
+                depth_x = (edge_threshold - nx) / edge_threshold;
 
             if (ny >= 1.0 - edge_threshold)
-                dy = 1;
+                depth_y = (ny - (1.0 - edge_threshold)) / edge_threshold;
             else if (ny <= edge_threshold)
-                dy = -1;
+                depth_y = (edge_threshold - ny) / edge_threshold;
+
+            if (depth_x > 1.0)
+                depth_x = 1.0;
+            if (depth_y > 1.0)
+                depth_y = 1.0;
+
+            speed_factor = fmax(depth_x, depth_y);
 
             int currently_in_edge = (dx != 0 || dy != 0);
             if (currently_in_edge) {
@@ -606,15 +743,22 @@ int main(int argc, char **argv)
             } else {
                 was_in_edge = 0;
             }
+
+            was_in_edge_x = (dx != 0);
+            was_in_edge_y = (dy != 0);
         } else {
             was_in_edge = 0;
+            was_in_edge_x = 0;
+            was_in_edge_y = 0;
         }
 
         pthread_mutex_lock(&state.lock);
-        int changed = (state.edge_active != should_active || state.dir_x != dx || state.dir_y != dy);
+        int changed = (state.edge_active != should_active || state.dir_x != dx || state.dir_y != dy ||
+                       fabs(state.speed_factor - speed_factor) > 0.0001);
         state.edge_active = should_active;
         state.dir_x = dx;
         state.dir_y = dy;
+        state.speed_factor = speed_factor;
         if (changed)
             pthread_cond_signal(&state.cond);
         pthread_mutex_unlock(&state.lock);
@@ -626,8 +770,11 @@ int main(int argc, char **argv)
         }
 
         if (!touchpad_available) {
-            usleep(TOUCHPAD_DISCONNECT_TIMEOUT_MS * 1000);
-            timeout_ms = 0;
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            int64_t now_ms = now.tv_sec * 1000LL + now.tv_nsec / 1000000LL;
+            int64_t remaining = next_reopen_at_ms - now_ms;
+            timeout_ms = remaining > 0 ? (int)remaining : 0;
         }
 
         int ret = touchpad_available ? poll(&pfd, 1, timeout_ms) : 0;
@@ -664,11 +811,13 @@ int main(int argc, char **argv)
 
                         if (ev.code == ABS_MT_POSITION_X || ev.code == ABS_X) {
                             slot_x[current_slot] = ev.value;
-                            preferred_slot = current_slot;
+                            if (preferred_slot < 0 || preferred_slot == current_slot)
+                                preferred_slot = current_slot;
                         }
                         if (ev.code == ABS_MT_POSITION_Y || ev.code == ABS_Y) {
                             slot_y[current_slot] = ev.value;
-                            preferred_slot = current_slot;
+                            if (preferred_slot < 0 || preferred_slot == current_slot)
+                                preferred_slot = current_slot;
                         }
 
                         if (ev.code == ABS_MT_TRACKING_ID) {
@@ -682,10 +831,14 @@ int main(int argc, char **argv)
                                 slot_active[current_slot] = 1;
                             }
                         }
-                    } else if (ev.type == EV_KEY && ev.code == BTN_TOUCH && ev.value == 0) {
+                    } else if (ev.type == EV_KEY &&
+                               ((ev.code == BTN_TOUCH || ev.code == BTN_TOOL_FINGER) &&
+                                ev.value == 0)) {
                         last_x = -1;
                         last_y = -1;
                         was_in_edge = 0;
+                        was_in_edge_x = 0;
+                        was_in_edge_y = 0;
                         preferred_slot = -1;
                         for (int i = 0; i < slot_count; i++) {
                             slot_active[i] = 0;
@@ -729,12 +882,15 @@ int main(int argc, char **argv)
                 state.edge_active = 0;
                 state.dir_x = 0;
                 state.dir_y = 0;
+                state.speed_factor = 0.0;
                 pthread_cond_signal(&state.cond);
                 pthread_mutex_unlock(&state.lock);
 
                 last_x = -1;
                 last_y = -1;
                 was_in_edge = 0;
+                was_in_edge_x = 0;
+                was_in_edge_y = 0;
                 touchpad_available = 0;
                 cleanup_touchpad_resources(&tp);
                 pfd.fd = -1;
@@ -763,6 +919,12 @@ int main(int argc, char **argv)
                     read_flags = LIBEVDEV_READ_FLAG_NORMAL;
                     current_slot = 0;
                     preferred_slot = -1;
+                    last_x = -1;
+                    last_y = -1;
+                    was_in_edge = 0;
+                    was_in_edge_x = 0;
+                    was_in_edge_y = 0;
+                    edge_enter_time = (struct timespec){0};
                 }
                 next_reopen_at_ms = now_ms + TOUCHPAD_REOPEN_POLL_MS;
             }
