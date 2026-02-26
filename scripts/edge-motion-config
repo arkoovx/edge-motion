@@ -18,16 +18,21 @@ DEFAULT_ARGS=(
 )
 
 msg() {
-  if command -v whiptail >/dev/null 2>&1; then
-    whiptail --title "edge-motion" --msgbox "$1" 12 78
+  local text="$1"
+  if command -v zenity >/dev/null 2>&1 && [[ -n "${DISPLAY:-}" ]]; then
+    zenity --info --title="edge-motion" --width=520 --text="$text" >/dev/null 2>&1 || true
+  elif command -v whiptail >/dev/null 2>&1; then
+    whiptail --title "edge-motion" --msgbox "$text" 12 78
   else
-    printf '\n%s\n\n' "$1"
+    printf '\n%s\n\n' "$text"
   fi
 }
 
 confirm() {
   local text="$1"
-  if command -v whiptail >/dev/null 2>&1; then
+  if command -v zenity >/dev/null 2>&1 && [[ -n "${DISPLAY:-}" ]]; then
+    zenity --question --title="edge-motion" --width=520 --text="$text"
+  elif command -v whiptail >/dev/null 2>&1; then
     whiptail --title "edge-motion" --yesno "$text" 12 78
   else
     read -r -p "$text [y/N]: " ans
@@ -59,6 +64,7 @@ read_current_args() {
 find_opt() {
   local key="$1"; shift
   local -a arr=("$@")
+  local i
   for ((i=0; i<${#arr[@]}; i++)); do
     if [[ "${arr[i]}" == "$key" ]]; then
       if (( i + 1 < ${#arr[@]} )) && [[ "${arr[i+1]}" != --* ]]; then
@@ -94,8 +100,51 @@ build_args() {
 }
 
 validate() {
-  local value regex="$1"; value="$2"
+  local regex="$1" value="$2"
   [[ "$value" =~ $regex ]]
+}
+
+validate_ranges() {
+  local mode_v="$1" threshold_v="$2" hold_v="$3" pulse_v="$4" step_v="$5" max_v="$6" accel_v="$7" deadzone_v="$8"
+
+  awk -v mode="$mode_v" -v t="$threshold_v" -v h="$hold_v" -v p="$pulse_v" -v s="$step_v" -v m="$max_v" -v a="$accel_v" -v d="$deadzone_v" '
+    BEGIN {
+      if (mode != "motion" && mode != "scroll") exit 10;
+      if (!(t >= 0 && t <= 0.49)) exit 11;
+      if (!(h >= 0 && h <= 5000)) exit 12;
+      if (!(p >= 1 && p <= 500)) exit 13;
+      if (!(s > 0 && s <= 10)) exit 14;
+      if (!(m > 0 && m <= 20)) exit 15;
+      if (!(a >= 1 && a <= 6)) exit 16;
+      if (!(d >= 0 && d <= 0.49)) exit 17;
+      exit 0;
+    }
+  '
+}
+
+to_scaled_int() {
+  local value="$1" scale="$2"
+  awk -v v="$value" -v s="$scale" 'BEGIN { printf "%d", (v * s + 0.5) }'
+}
+
+from_scaled_int() {
+  local value="$1" scale="$2" precision="$3"
+  awk -v v="$value" -v s="$scale" -v p="$precision" 'BEGIN { printf "%.*f", p, (v / s) }'
+}
+
+set_defaults() {
+  mode="motion"
+  threshold="0.06"
+  hold_ms="90"
+  pulse_ms="12"
+  pulse_step="1.5"
+  max_speed="2.4"
+  accel="1.6"
+  deadzone="0.07"
+  natural="0"
+  diagonal="0"
+  twofinger="0"
+  grab="0"
 }
 
 save_and_restart() {
@@ -108,8 +157,47 @@ save_and_restart() {
   systemctl restart "$SERVICE_NAME"
 }
 
-menu_loop() {
-  local mode threshold hold_ms pulse_ms pulse_step max_speed accel deadzone natural diagonal twofinger grab
+zenity_pick_mode_and_toggles() {
+  local mode_h natural_h diagonal_h twofinger_h grab_h
+  local mode_values natural_values diagonal_values twofinger_values grab_values
+  [[ "$mode" == "motion" ]] && mode_h="motion" || mode_h="scroll"
+  [[ "$natural" == "1" ]] && natural_h="on" || natural_h="off"
+  [[ "$diagonal" == "1" ]] && diagonal_h="on" || diagonal_h="off"
+  [[ "$twofinger" == "1" ]] && twofinger_h="on" || twofinger_h="off"
+  [[ "$grab" == "1" ]] && grab_h="on" || grab_h="off"
+
+  [[ "$mode_h" == "motion" ]] && mode_values="motion|scroll" || mode_values="scroll|motion"
+  [[ "$natural_h" == "on" ]] && natural_values="on|off" || natural_values="off|on"
+  [[ "$diagonal_h" == "on" ]] && diagonal_values="on|off" || diagonal_values="off|on"
+  [[ "$twofinger_h" == "on" ]] && twofinger_values="on|off" || twofinger_values="off|on"
+  [[ "$grab_h" == "on" ]] && grab_values="on|off" || grab_values="off|on"
+
+  local out
+  out=$(zenity --forms --title="edge-motion: кнопки и режим" --width=560 \
+    --text="Выберите режим и переключатели" \
+    --separator='|' \
+    --add-combo="Режим" --combo-values="$mode_values" \
+    --add-combo="Natural scroll" --combo-values="$natural_values" \
+    --add-combo="Diagonal scroll" --combo-values="$diagonal_values" \
+    --add-combo="Two-finger scroll" --combo-values="$twofinger_values" \
+    --add-combo="Grab touchpad" --combo-values="$grab_values") || return 1
+
+  local n d t g
+  IFS='|' read -r mode_h n d t g <<<"$out"
+  mode="$mode_h"
+  [[ "$n" == "on" ]] && natural=1 || natural=0
+  [[ "$d" == "on" ]] && diagonal=1 || diagonal=0
+  [[ "$t" == "on" ]] && twofinger=1 || twofinger=0
+  [[ "$g" == "on" ]] && grab=1 || grab=0
+}
+
+zenity_numeric_form() {
+  local out
+  out=$(zenity --forms --title="edge-motion: ввод чисел" --width=560 \
+    --text="Введите числовые параметры" --separator='|' \
+    --add-entry="threshold" --add-entry="hold-ms" --add-entry="pulse-ms" \
+    --add-entry="pulse-step" --add-entry="max-speed" --add-entry="accel-exponent" \
+    --add-entry="deadzone") || return 1
 
   mode="$(find_opt --mode "${CURRENT_ARGS[@]}" || echo motion)"
   threshold="$(find_opt --threshold "${CURRENT_ARGS[@]}" || echo 0.06)"
@@ -124,6 +212,53 @@ menu_loop() {
   twofinger="$(find_opt --two-finger-scroll "${CURRENT_ARGS[@]}" || echo 0)"
   if find_opt --grab "${CURRENT_ARGS[@]}" >/dev/null; then grab=1; else grab=0; fi
 
+  if ! validate_ranges "$mode" "$th" "$hm" "$pm" "$ps" "$ms" "$ac" "$dz"; then
+    msg "Часть значений вне допустимого диапазона.\nthreshold/deadzone: 0..0.49, hold-ms: 0..5000, pulse-ms: 1..500, pulse-step: >0..10, max-speed: >0..20, accel: 1..6"
+    return 1
+  fi
+
+  threshold="$th"
+  hold_ms="$hm"
+  pulse_ms="$pm"
+  pulse_step="$ps"
+  max_speed="$ms"
+  accel="$ac"
+  deadzone="$dz"
+}
+
+zenity_sliders() {
+  local val
+
+  val=$(zenity --scale --title="threshold" --text="Ширина краевой зоны (0.00..0.49)" \
+    --value="$(to_scaled_int "$threshold" 100)" --min-value=0 --max-value=49 --step=1 --print-partial) || return 1
+  threshold="$(from_scaled_int "$val" 100 2)"
+
+  val=$(zenity --scale --title="hold-ms" --text="Задержка до старта (мс)" \
+    --value="$hold_ms" --min-value=0 --max-value=400 --step=1 --print-partial) || return 1
+  hold_ms="$val"
+
+  val=$(zenity --scale --title="pulse-ms" --text="Интервал импульсов (мс)" \
+    --value="$pulse_ms" --min-value=1 --max-value=80 --step=1 --print-partial) || return 1
+  pulse_ms="$val"
+
+  val=$(zenity --scale --title="pulse-step" --text="Базовый шаг (0.1..5.0)" \
+    --value="$(to_scaled_int "$pulse_step" 10)" --min-value=1 --max-value=50 --step=1 --print-partial) || return 1
+  pulse_step="$(from_scaled_int "$val" 10 1)"
+
+  val=$(zenity --scale --title="max-speed" --text="Макс. скорость (0.1..8.0)" \
+    --value="$(to_scaled_int "$max_speed" 10)" --min-value=1 --max-value=80 --step=1 --print-partial) || return 1
+  max_speed="$(from_scaled_int "$val" 10 1)"
+
+  val=$(zenity --scale --title="accel-exponent" --text="Ускорение (1.0..4.0)" \
+    --value="$(to_scaled_int "$accel" 10)" --min-value=10 --max-value=40 --step=1 --print-partial) || return 1
+  accel="$(from_scaled_int "$val" 10 1)"
+
+  val=$(zenity --scale --title="deadzone" --text="Мёртвая зона (0.00..0.49)" \
+    --value="$(to_scaled_int "$deadzone" 100)" --min-value=0 --max-value=49 --step=1 --print-partial) || return 1
+  deadzone="$(from_scaled_int "$val" 100 2)"
+}
+
+run_zenity_ui() {
   while true; do
     local prompt mode_label natural_label diagonal_label twofinger_label grab_label
     if [[ "$mode" == "motion" ]]; then mode_label="Курсор (motion)"; else mode_label="Скролл (scroll)"; fi
@@ -153,8 +288,8 @@ menu_loop() {
         "reset" "↺ Сбросить на оптимальные значения" \
         "exit" "Выход без изменений" 3>&1 1>&2 2>&3) || action="exit"
     else
-      echo "$prompt"
-      read -r -p "[edit/save/reset/exit]: " action
+      echo -e "$prompt"
+      read -r -p "[mode/threshold/hold-ms/pulse-ms/pulse-step/max-speed/accel/deadzone/natural/diagonal/twofinger/grab/save/reset/exit]: " action
     fi
 
     case "$action" in
@@ -206,7 +341,15 @@ menu_loop() {
       grab)
         if [[ "$grab" == "1" ]]; then grab="0"; else grab="1"; fi
         ;;
+      natural) [[ "$natural" == "1" ]] && natural="0" || natural="1" ;;
+      diagonal) [[ "$diagonal" == "1" ]] && diagonal="0" || diagonal="1" ;;
+      twofinger) [[ "$twofinger" == "1" ]] && twofinger="0" || twofinger="1" ;;
+      grab) [[ "$grab" == "1" ]] && grab="0" || grab="1" ;;
       save)
+        if ! validate_ranges "$mode" "$threshold" "$hold_ms" "$pulse_ms" "$pulse_step" "$max_speed" "$accel" "$deadzone"; then
+          msg "Проверьте диапазоны числовых параметров перед сохранением."
+          continue
+        fi
         build_args "$mode" "$threshold" "$hold_ms" "$pulse_ms" "$pulse_step" "$max_speed" "$accel" "$deadzone" "$natural" "$diagonal" "$twofinger" "$grab"
         if confirm "Сохранить и выполнить автоперезапуск сервиса с новыми параметрами?"; then
           save_and_restart
@@ -235,4 +378,22 @@ menu_loop() {
 
 require_root
 read_current_args
-menu_loop
+
+mode="$(find_opt --mode "${CURRENT_ARGS[@]}" || echo motion)"
+threshold="$(find_opt --threshold "${CURRENT_ARGS[@]}" || echo 0.06)"
+hold_ms="$(find_opt --hold-ms "${CURRENT_ARGS[@]}" || echo 90)"
+pulse_ms="$(find_opt --pulse-ms "${CURRENT_ARGS[@]}" || echo 12)"
+pulse_step="$(find_opt --pulse-step "${CURRENT_ARGS[@]}" || echo 1.5)"
+max_speed="$(find_opt --max-speed "${CURRENT_ARGS[@]}" || echo 2.4)"
+accel="$(find_opt --accel-exponent "${CURRENT_ARGS[@]}" || echo 1.6)"
+deadzone="$(find_opt --deadzone "${CURRENT_ARGS[@]}" || echo 0.07)"
+natural="$(find_opt --natural-scroll "${CURRENT_ARGS[@]}" || echo 0)"
+diagonal="$(find_opt --diagonal-scroll "${CURRENT_ARGS[@]}" || echo 0)"
+twofinger="$(find_opt --two-finger-scroll "${CURRENT_ARGS[@]}" || echo 0)"
+if find_opt --grab "${CURRENT_ARGS[@]}" >/dev/null; then grab=1; else grab=0; fi
+
+if command -v zenity >/dev/null 2>&1 && [[ -n "${DISPLAY:-}" ]]; then
+  run_zenity_ui
+else
+  run_text_ui
+fi

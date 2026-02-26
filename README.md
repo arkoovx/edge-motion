@@ -13,7 +13,7 @@
 - Тонкую настройку чувствительности/ускорения.
 - Восстановление после переподключения устройства.
 - Запуск как `systemd`-сервис (автостарт после ребута).
-- Простое TUI-меню настройки: `edge-motion-config`.
+- Лёгкий UI-конфигуратор: графический интерфейс (zenity) с кнопками/ползунками и fallback в TUI.
 - Безопасный автоапдейт перед стартом сервиса (если указан репозиторий исходников).
 
 ---
@@ -24,7 +24,7 @@
 
 ```bash
 sudo apt update
-sudo apt install -y build-essential pkg-config libevdev-dev libudev-dev
+sudo apt install -y build-essential pkg-config libevdev-dev libudev-dev zenity
 ```
 
 ### 2) Сборка + установка
