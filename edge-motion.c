@@ -19,6 +19,8 @@
 #define DEFAULT_HOLD_MS 80
 #define DEFAULT_PULSE_MS 10
 #define DEFAULT_PULSE_STEP 3
+#define TOUCHPAD_DISCONNECT_TIMEOUT_MS 200
+#define TOUCHPAD_REOPEN_POLL_MS 250
 
 static double edge_threshold = DEFAULT_EDGE_THRESHOLD;
 static int hold_ms = DEFAULT_HOLD_MS;
@@ -61,7 +63,12 @@ static inline int emit_rel(int ufd, int code, int val)
     ev.type = EV_REL;
     ev.code = code;
     ev.value = val;
-    return write(ufd, &ev, sizeof(ev)) == (ssize_t)sizeof(ev) ? 0 : -1;
+    ssize_t ret;
+    do {
+        ret = write(ufd, &ev, sizeof(ev));
+    } while (ret < 0 && errno == EINTR);
+
+    return ret == (ssize_t)sizeof(ev) ? 0 : -1;
 }
 
 static inline int emit_syn(int ufd)
@@ -69,7 +76,53 @@ static inline int emit_syn(int ufd)
     struct input_event ev = {0};
     ev.type = EV_SYN;
     ev.code = SYN_REPORT;
-    return write(ufd, &ev, sizeof(ev)) == (ssize_t)sizeof(ev) ? 0 : -1;
+    ssize_t ret;
+    do {
+        ret = write(ufd, &ev, sizeof(ev));
+    } while (ret < 0 && errno == EINTR);
+
+    return ret == (ssize_t)sizeof(ev) ? 0 : -1;
+}
+
+static inline int64_t timespec_to_ms(const struct timespec *ts)
+{
+    return ts->tv_sec * 1000LL + ts->tv_nsec / 1000000LL;
+}
+
+static int reset_multitouch_state(struct libevdev *dev, int **slot_x, int **slot_y,
+                                  unsigned char **slot_active, int *slot_count)
+{
+    const struct input_absinfo *slot_info = libevdev_get_abs_info(dev, ABS_MT_SLOT);
+    int new_slot_count = 1;
+
+    if (slot_info && slot_info->maximum >= slot_info->minimum)
+        new_slot_count = slot_info->maximum - slot_info->minimum + 1;
+
+    int *new_slot_x = calloc((size_t)new_slot_count, sizeof(int));
+    int *new_slot_y = calloc((size_t)new_slot_count, sizeof(int));
+    unsigned char *new_slot_active = calloc((size_t)new_slot_count, sizeof(unsigned char));
+    if (!new_slot_x || !new_slot_y || !new_slot_active) {
+        free(new_slot_x);
+        free(new_slot_y);
+        free(new_slot_active);
+        return -1;
+    }
+
+    for (int i = 0; i < new_slot_count; i++) {
+        new_slot_x[i] = -1;
+        new_slot_y[i] = -1;
+    }
+
+    free(*slot_x);
+    free(*slot_y);
+    free(*slot_active);
+
+    *slot_x = new_slot_x;
+    *slot_y = new_slot_y;
+    *slot_active = new_slot_active;
+    *slot_count = new_slot_count;
+
+    return 0;
 }
 
 static void cleanup_touchpad_resources(struct touchpad_resources *tp)
@@ -93,6 +146,8 @@ static void cleanup_touchpad_resources(struct touchpad_resources *tp)
 static int create_uinput_device(void)
 {
     int fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0)
+        fd = open("/dev/input/uinput", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0)
         return -1;
 
@@ -354,23 +409,9 @@ int main(int argc, char **argv)
     int slot_count = 1;
     struct timespec last_motion = {0};
 
-    const struct input_absinfo *slot_info = libevdev_get_abs_info(tp.dev, ABS_MT_SLOT);
-    if (slot_info && slot_info->maximum >= slot_info->minimum)
-        slot_count = slot_info->maximum - slot_info->minimum + 1;
-
-    slot_x = calloc((size_t)slot_count, sizeof(int));
-    slot_y = calloc((size_t)slot_count, sizeof(int));
-    slot_active = calloc((size_t)slot_count, sizeof(unsigned char));
-    if (!slot_x || !slot_y || !slot_active) {
+    if (reset_multitouch_state(tp.dev, &slot_x, &slot_y, &slot_active, &slot_count) < 0) {
         fprintf(stderr, "Не удалось выделить память под multitouch-состояние.\n");
-        free(slot_x);
-        free(slot_y);
-        free(slot_active);
         goto cleanup;
-    }
-    for (int i = 0; i < slot_count; i++) {
-        slot_x[i] = -1;
-        slot_y[i] = -1;
     }
 
     struct pollfd pfd = {.fd = tp.input_fd, .events = POLLIN};
@@ -379,7 +420,7 @@ int main(int argc, char **argv)
     while (running) {
         int should_active = 0;
         int dx = 0, dy = 0;
-        long diff_ms = 0;
+        int64_t diff_ms = 0;
 
         if (last_x >= 0 && last_y >= 0 && max_x > min_x && max_y > min_y) {
             double nx = (double)(last_x - min_x) / (double)(max_x - min_x);
@@ -399,8 +440,7 @@ int main(int argc, char **argv)
                 struct timespec now;
                 clock_gettime(CLOCK_MONOTONIC, &now);
                 if (motion_initialized) {
-                    diff_ms = (now.tv_sec - last_motion.tv_sec) * 1000L +
-                              (now.tv_nsec - last_motion.tv_nsec) / 1000000L;
+                    diff_ms = timespec_to_ms(&now) - timespec_to_ms(&last_motion);
                 }
                 if (motion_initialized && diff_ms >= hold_ms)
                     should_active = 1;
@@ -423,7 +463,7 @@ int main(int argc, char **argv)
         }
 
         if (!touchpad_available)
-            timeout_ms = 200;
+            timeout_ms = TOUCHPAD_DISCONNECT_TIMEOUT_MS;
 
         int ret = poll(&pfd, 1, timeout_ms);
         if (ret < 0) {
@@ -562,6 +602,15 @@ int main(int argc, char **argv)
             if (now_ms >= next_reopen_at_ms) {
                 if (reopen_touchpad(&tp, &min_x, &max_x, &min_y, &max_y, &bounce_thr_x,
                                     &bounce_thr_y) == 0) {
+                    if (reset_multitouch_state(tp.dev, &slot_x, &slot_y, &slot_active, &slot_count) < 0) {
+                        if (verbose)
+                            fprintf(stderr, "Не удалось обновить multitouch-состояние после переподключения.\n");
+                        cleanup_touchpad_resources(&tp);
+                        pfd.fd = -1;
+                        next_reopen_at_ms = now_ms + TOUCHPAD_REOPEN_POLL_MS;
+                        continue;
+                    }
+
                     if (verbose)
                         fprintf(stderr, "Тачпад переподключён: %s\n", tp.devnode);
 
@@ -570,8 +619,10 @@ int main(int argc, char **argv)
                     pfd.events = POLLIN;
                     pfd.revents = 0;
                     read_flags = LIBEVDEV_READ_FLAG_NORMAL;
+                    current_slot = 0;
+                    preferred_slot = -1;
                 }
-                next_reopen_at_ms = now_ms + 250;
+                next_reopen_at_ms = now_ms + TOUCHPAD_REOPEN_POLL_MS;
             }
         }
     }
