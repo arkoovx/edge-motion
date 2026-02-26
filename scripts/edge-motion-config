@@ -199,19 +199,18 @@ zenity_numeric_form() {
     --add-entry="pulse-step" --add-entry="max-speed" --add-entry="accel-exponent" \
     --add-entry="deadzone") || return 1
 
-  local th hm pm ps ms ac dz
-  IFS='|' read -r th hm pm ps ms ac dz <<<"$out"
-
-  if ! validate '^[0-9]+(\.[0-9]+)?$' "$th" || \
-     ! validate '^[0-9]+$' "$hm" || \
-     ! validate '^[0-9]+$' "$pm" || \
-     ! validate '^[0-9]+(\.[0-9]+)?$' "$ps" || \
-     ! validate '^[0-9]+(\.[0-9]+)?$' "$ms" || \
-     ! validate '^[0-9]+(\.[0-9]+)?$' "$ac" || \
-     ! validate '^[0-9]+(\.[0-9]+)?$' "$dz"; then
-    msg "Ошибка в формате чисел. Проверьте значения и попробуйте снова."
-    return 1
-  fi
+  mode="$(find_opt --mode "${CURRENT_ARGS[@]}" || echo motion)"
+  threshold="$(find_opt --threshold "${CURRENT_ARGS[@]}" || echo 0.06)"
+  hold_ms="$(find_opt --hold-ms "${CURRENT_ARGS[@]}" || echo 90)"
+  pulse_ms="$(find_opt --pulse-ms "${CURRENT_ARGS[@]}" || echo 12)"
+  pulse_step="$(find_opt --pulse-step "${CURRENT_ARGS[@]}" || echo 1.5)"
+  max_speed="$(find_opt --max-speed "${CURRENT_ARGS[@]}" || echo 2.4)"
+  accel="$(find_opt --accel-exponent "${CURRENT_ARGS[@]}" || echo 1.6)"
+  deadzone="$(find_opt --deadzone "${CURRENT_ARGS[@]}" || echo 0.07)"
+  natural="$(find_opt --natural-scroll "${CURRENT_ARGS[@]}" || echo 0)"
+  diagonal="$(find_opt --diagonal-scroll "${CURRENT_ARGS[@]}" || echo 0)"
+  twofinger="$(find_opt --two-finger-scroll "${CURRENT_ARGS[@]}" || echo 0)"
+  if find_opt --grab "${CURRENT_ARGS[@]}" >/dev/null; then grab=1; else grab=0; fi
 
   if ! validate_ranges "$mode" "$th" "$hm" "$pm" "$ps" "$ms" "$ac" "$dz"; then
     msg "Часть значений вне допустимого диапазона.\nthreshold/deadzone: 0..0.49, hold-ms: 0..5000, pulse-ms: 1..500, pulse-step: >0..10, max-speed: >0..20, accel: 1..6"
@@ -261,63 +260,12 @@ zenity_sliders() {
 
 run_zenity_ui() {
   while true; do
-    local mode_label
-    [[ "$mode" == "motion" ]] && mode_label="Курсор" || mode_label="Скролл"
-
-    local action
-    action=$(zenity --list --title="edge-motion: настройки" --width=700 --height=420 \
-      --text="Режим: <b>$mode_label</b> | threshold=$threshold hold=$hold_ms pulse=$pulse_ms step=$pulse_step max=$max_speed accel=$accel deadzone=$deadzone" \
-      --column="Действие" --hide-header \
-      "Режим и переключатели (кнопки)" \
-      "Числовые параметры (ввод)" \
-      "Числовые параметры (ползунки)" \
-      "Сбросить к оптимальным" \
-      "Сохранить и перезапустить" \
-      "Выход без изменений") || action="Выход без изменений"
-
-    case "$action" in
-      "Режим и переключатели (кнопки)")
-        zenity_pick_mode_and_toggles || true
-        ;;
-      "Числовые параметры (ввод)")
-        zenity_numeric_form || true
-        ;;
-      "Числовые параметры (ползунки)")
-        zenity_sliders || true
-        ;;
-      "Сбросить к оптимальным")
-        if confirm "Сбросить на значения по умолчанию?"; then
-          set_defaults
-        fi
-        ;;
-      "Сохранить и перезапустить")
-        if ! validate_ranges "$mode" "$threshold" "$hold_ms" "$pulse_ms" "$pulse_step" "$max_speed" "$accel" "$deadzone"; then
-          msg "Проверьте диапазоны числовых параметров перед сохранением."
-          continue
-        fi
-        build_args "$mode" "$threshold" "$hold_ms" "$pulse_ms" "$pulse_step" "$max_speed" "$accel" "$deadzone" "$natural" "$diagonal" "$twofinger" "$grab"
-        if confirm "Сохранить и перезапустить сервис?"; then
-          save_and_restart
-          msg "Готово ✅ Конфиг сохранён и сервис перезапущен."
-          break
-        fi
-        ;;
-      *)
-        msg "Выход без изменений."
-        break
-        ;;
-    esac
-  done
-}
-
-run_text_ui() {
-  while true; do
     local prompt mode_label natural_label diagonal_label twofinger_label grab_label
-    [[ "$mode" == "motion" ]] && mode_label="Курсор (motion)" || mode_label="Скролл (scroll)"
-    [[ "$natural" == "1" ]] && natural_label="Вкл" || natural_label="Выкл"
-    [[ "$diagonal" == "1" ]] && diagonal_label="Вкл" || diagonal_label="Выкл"
-    [[ "$twofinger" == "1" ]] && twofinger_label="Вкл" || twofinger_label="Выкл"
-    [[ "$grab" == "1" ]] && grab_label="Вкл" || grab_label="Выкл"
+    if [[ "$mode" == "motion" ]]; then mode_label="Курсор (motion)"; else mode_label="Скролл (scroll)"; fi
+    if [[ "$natural" == "1" ]]; then natural_label="Вкл"; else natural_label="Выкл"; fi
+    if [[ "$diagonal" == "1" ]]; then diagonal_label="Вкл"; else diagonal_label="Выкл"; fi
+    if [[ "$twofinger" == "1" ]]; then twofinger_label="Вкл"; else twofinger_label="Выкл"; fi
+    if [[ "$grab" == "1" ]]; then grab_label="Вкл"; else grab_label="Выкл"; fi
 
     prompt="Режим: $mode_label\nthreshold=$threshold, hold-ms=$hold_ms, pulse-ms=$pulse_ms\npulse-step=$pulse_step, max-speed=$max_speed, accel=$accel, deadzone=$deadzone\nnatural=$natural_label, diagonal=$diagonal_label, two-finger=$twofinger_label, grab=$grab_label"
 
@@ -345,7 +293,9 @@ run_text_ui() {
     fi
 
     case "$action" in
-      mode) [[ "$mode" == "motion" ]] && mode="scroll" || mode="motion" ;;
+      mode)
+        if [[ "$mode" == "motion" ]]; then mode="scroll"; else mode="motion"; fi
+        ;;
       threshold|hold-ms|pulse-ms|pulse-step|max-speed|accel|deadzone)
         local current regex question entered
         case "$action" in
@@ -368,31 +318,28 @@ run_text_ui() {
           msg "Ошибка в формате значения. Попробуйте снова."
           continue
         fi
-        local new_threshold="$threshold" new_hold_ms="$hold_ms" new_pulse_ms="$pulse_ms" new_pulse_step="$pulse_step" new_max_speed="$max_speed" new_accel="$accel" new_deadzone="$deadzone"
-        case "$action" in
-          threshold) new_threshold="$entered" ;;
-          hold-ms) new_hold_ms="$entered" ;;
-          pulse-ms) new_pulse_ms="$entered" ;;
-          pulse-step) new_pulse_step="$entered" ;;
-          max-speed) new_max_speed="$entered" ;;
-          accel) new_accel="$entered" ;;
-          deadzone) new_deadzone="$entered" ;;
-        esac
-
-        if ! validate_ranges "$mode" "$new_threshold" "$new_hold_ms" "$new_pulse_ms" "$new_pulse_step" "$new_max_speed" "$new_accel" "$new_deadzone"; then
-          msg "Значение вне диапазона. Проверьте limits в подсказке."
-          continue
-        fi
 
         case "$action" in
-          threshold) threshold="$new_threshold" ;;
-          hold-ms) hold_ms="$new_hold_ms" ;;
-          pulse-ms) pulse_ms="$new_pulse_ms" ;;
-          pulse-step) pulse_step="$new_pulse_step" ;;
-          max-speed) max_speed="$new_max_speed" ;;
-          accel) accel="$new_accel" ;;
-          deadzone) deadzone="$new_deadzone" ;;
+          threshold) threshold="$entered" ;;
+          hold-ms) hold_ms="$entered" ;;
+          pulse-ms) pulse_ms="$entered" ;;
+          pulse-step) pulse_step="$entered" ;;
+          max-speed) max_speed="$entered" ;;
+          accel) accel="$entered" ;;
+          deadzone) deadzone="$entered" ;;
         esac
+        ;;
+      natural)
+        if [[ "$natural" == "1" ]]; then natural="0"; else natural="1"; fi
+        ;;
+      diagonal)
+        if [[ "$diagonal" == "1" ]]; then diagonal="0"; else diagonal="1"; fi
+        ;;
+      twofinger)
+        if [[ "$twofinger" == "1" ]]; then twofinger="0"; else twofinger="1"; fi
+        ;;
+      grab)
+        if [[ "$grab" == "1" ]]; then grab="0"; else grab="1"; fi
         ;;
       natural) [[ "$natural" == "1" ]] && natural="0" || natural="1" ;;
       diagonal) [[ "$diagonal" == "1" ]] && diagonal="0" || diagonal="1" ;;
@@ -412,7 +359,9 @@ run_text_ui() {
         ;;
       reset)
         if confirm "Сбросить параметры на оптимальные значения по умолчанию?"; then
-          set_defaults
+          CURRENT_ARGS=("${DEFAULT_ARGS[@]}")
+          mode="motion"; threshold="0.06"; hold_ms="90"; pulse_ms="12"; pulse_step="1.5"
+          max_speed="2.4"; accel="1.6"; deadzone="0.07"; natural="0"; diagonal="0"; twofinger="0"; grab="0"
           msg "Значения сброшены. Нажмите Save для применения."
         fi
         ;;
