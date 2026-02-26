@@ -9,7 +9,9 @@ LIBS := $(shell pkg-config --libs libevdev libudev 2>/dev/null)
 CPPFLAGS += $(shell pkg-config --cflags libevdev libudev 2>/dev/null)
 LDFLAGS += -pthread -lm
 
-.PHONY: help build clean install uninstall install-service uninstall-service deps-check
+.PHONY: all help build clean install uninstall install-service uninstall-service deps-check
+
+all: build
 
 help:
 	@echo "Targets:"
@@ -41,10 +43,16 @@ uninstall:
 
 install-service: install
 	install -m 0644 systemd/edge-motion.service $(DESTDIR)$(UNITDIR)/edge-motion.service
-	systemctl daemon-reload
-	systemctl enable --now edge-motion.service
+	@if command -v systemctl >/dev/null 2>&1; then \
+		systemctl daemon-reload; \
+		systemctl enable --now edge-motion.service; \
+	else \
+		echo "systemctl not found: service file installed only"; \
+	fi
 
 uninstall-service:
-	-systemctl disable --now edge-motion.service
+	@if command -v systemctl >/dev/null 2>&1; then \
+		systemctl disable --now edge-motion.service || true; \
+		systemctl daemon-reload; \
+	fi
 	rm -f $(DESTDIR)$(UNITDIR)/edge-motion.service
-	systemctl daemon-reload
