@@ -1,5 +1,5 @@
 [Unit]
-Description=Edge Motion Daemon (Touchpad edge scrolling)
+Description=Edge Motion (touchpad edge scrolling helper)
 After=multi-user.target
 
 [Service]
@@ -8,6 +8,10 @@ ExecStart=/usr/local/bin/edge-motion --threshold 0.06 --hold-ms 80 --pulse-ms 10
 Restart=always
 RestartSec=2
 KillSignal=SIGTERM
+
+# This daemon reads touchpad events and emits mouse events via uinput,
+# so it intentionally runs with elevated privileges by default.
+User=root
 
 [Install]
 WantedBy=multi-user.target

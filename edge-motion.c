@@ -441,7 +441,7 @@ static void *pulser_thread(void *arg)
 
 static void print_usage(const char *prog)
 {
-    printf("edge-motion v4.2 Ultimate — движение курсора у края тачпада\n\n");
+    printf("edge-motion — helper для edge scrolling на тачпаде\n\n");
     printf("Usage: %s [OPTIONS]\n", prog);
     printf("  --threshold <0.01-0.5>   Порог края (default %.2f)\n", DEFAULT_EDGE_THRESHOLD);
     printf("  --hold-ms <ms>           Задержка (default %d)\n", DEFAULT_HOLD_MS);

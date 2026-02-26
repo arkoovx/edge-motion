@@ -1,105 +1,170 @@
-## edge-motion
+# edge-motion
 
-Утилита для Linux, которая двигает курсор, если палец удерживается у края тачпада (аналог edge scrolling).
+`edge-motion` — это маленький фоновый сервис для Linux, который добавляет **edge scrolling** (прокрутку при удержании пальца у края тачпада).
 
-## Что уже исправлено в коде
+Если сказать по‑простому: вы держите палец у края тачпада, а курсор плавно «ползёт» в нужную сторону. Это удобно, когда встроенная прокрутка тачпада ведёт себя неудобно или её нет.
 
-- Исправлен анти-дребезг: таймер `hold_ms` обновляется только по завершенному кадру (`SYN_REPORT`) и только при реальном смещении выше порога.
-- Исправлен busy-loop при отключении устройства: обработка `POLLERR|POLLHUP|POLLNVAL` теперь уводит в reconnect.
-- Усилена надежность запуска/остановки: проверки `ioctl`, аккуратный cleanup и safe join потока.
+---
 
-## Быстрый старт (Ubuntu)
+## Для кого этот проект
 
-### 1) Установить зависимости
+Этот репозиторий сделан для людей, которые:
+
+- не хотят «тонуть» в сложной Linux-настройке;
+- хотят запустить всё один раз и забыть;
+- хотят простой и понятный путь: **установил → проверил → подстроил скорость**.
+
+---
+
+## Как это правильно называется?
+
+- По-английски чаще всего: **edge scrolling**.
+- По-русски обычно говорят: «прокрутка/движение у края тачпада».
+
+В этом проекте используется термин **edge motion**, потому что утилита генерирует относительное движение курсора.
+
+---
+
+## Что умеет `edge-motion`
+
+- Автоматически находит подходящий тачпад.
+- Может показать список доступных тачпадов (`--list-devices`).
+- Умеет работать с явно указанным устройством (`--device /dev/input/eventX`).
+- Переподключается, если тачпад временно пропал.
+- Работает как `systemd`-сервис (автозапуск после перезагрузки).
+
+---
+
+## Быстрый старт (Ubuntu/Debian)
+
+### 1) Установите зависимости
 
 ```bash
 sudo apt update
 sudo apt install -y build-essential pkg-config libevdev-dev libudev-dev
 ```
 
-### 2) Собрать
+### 2) Соберите проект
 
 ```bash
 make build
 ```
 
-или напрямую:
-
-```bash
-gcc -O2 edge-motion.c -o edge-motion $(pkg-config --cflags --libs libevdev libudev) -pthread
-```
-
-### 3) Установить бинарник
+### 3) Установите бинарник
 
 ```bash
 sudo make install
 ```
 
-## Systemd (автозапуск)
-
-В репозитории уже есть готовый юнит: `systemd/edge-motion.service`.
-
-### Вариант A (через Makefile)
+### 4) Включите автозапуск через systemd
 
 ```bash
 sudo make install-service
 ```
 
-### Вариант B (вручную)
-
-```bash
-sudo install -m 0644 systemd/edge-motion.service /etc/systemd/system/edge-motion.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now edge-motion.service
-```
-
-Проверка:
+### 5) Проверьте, что всё запустилось
 
 ```bash
 systemctl status edge-motion.service
 journalctl -u edge-motion.service -f
 ```
 
-## Настройка
+---
 
-Отредактируйте `ExecStart` в `/etc/systemd/system/edge-motion.service`:
+## Настройка «под себя» (самое важное)
 
-- `--threshold 0.06` — зона у края (0.04 меньше, 0.08 больше).
-- `--hold-ms 80` — задержка перед стартом движения.
-- `--pulse-ms 10` — интервал импульсов.
-- `--pulse-step 3` — скорость движения.
+Сервис запускается с параметрами из файла:
 
-После правок:
+`/etc/systemd/system/edge-motion.service`
+
+Смотрите строку `ExecStart=...`.
+
+### Основные параметры
+
+- `--threshold 0.06` — насколько «узкая зона у края».
+  - меньше число (например `0.04`) → срабатывает легче;
+  - больше число (например `0.08`) → нужно ближе к самому краю.
+- `--hold-ms 80` — задержка перед началом движения (в миллисекундах).
+- `--pulse-ms 10` — как часто отправлять движение (интервал импульсов).
+- `--pulse-step 3` — скорость движения курсора (больше = быстрее).
+
+### Безопасный способ подобрать комфортные значения
+
+1. Меняйте **только один параметр за раз**.
+2. После изменения применяйте:
 
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl restart edge-motion.service
 ```
 
-## Удаление
+3. Проверяйте 1–2 минуты в реальной работе.
+4. Если «дёргается» — чуть увеличьте `--hold-ms` или уменьшите `--pulse-step`.
+
+---
+
+## Если тачпад не находится
+
+Покажите список обнаруженных устройств:
+
+```bash
+sudo /usr/local/bin/edge-motion --list-devices
+```
+
+Если ваш тачпад есть в списке как `/dev/input/eventX`, задайте его явно в `ExecStart`:
+
+```text
+ExecStart=/usr/local/bin/edge-motion --device /dev/input/eventX --threshold 0.06 --hold-ms 80 --pulse-ms 10 --pulse-step 3
+```
+
+---
+
+## Команды для удаления
 
 ```bash
 sudo make uninstall-service
 sudo make uninstall
 ```
 
-или вручную:
+---
+
+## Режим диагностики
+
+Запуск в foreground с подробным выводом:
 
 ```bash
-sudo systemctl disable --now edge-motion.service
-sudo rm -f /usr/local/bin/edge-motion
-sudo rm -f /etc/systemd/system/edge-motion.service
-sudo systemctl daemon-reload
+sudo /usr/local/bin/edge-motion --verbose
 ```
 
-## Если не собирается в контейнере/CI
-
-Проверьте, видит ли `pkg-config` нужные библиотеки:
+Справка по всем опциям:
 
 ```bash
-pkg-config --modversion libevdev libudev
+/usr/local/bin/edge-motion --help
 ```
 
-Если `Package ... not found` — не хватает dev-пакетов.
+---
 
-Если `apt update` в CI/sandbox дает `403 Forbidden`, это ограничение окружения, а не ошибка кода. В таком случае собирайте локально на Ubuntu/сервере с рабочими APT-репозиториями.
+## Как собрать вручную (без Makefile)
+
+```bash
+gcc -O2 edge-motion.c -o edge-motion $(pkg-config --cflags --libs libevdev libudev) -pthread -lm
+```
+
+---
+
+## Типичные проблемы
+
+- **`Missing deps` при `make build`**  
+  Не установлены dev-пакеты (`libevdev-dev`, `libudev-dev`, `pkg-config`).
+
+- **`Не удалось создать uinput`**  
+  Нужны права root (обычно запуск через systemd решает это).
+
+- **В CI/контейнере `apt update` даёт 403**  
+  Это ограничение окружения, а не ошибка проекта.
+
+---
+
+## Лицензия
+
+Пока лицензия не задана отдельным файлом. Если хотите использовать проект в продукте/дистрибутиве — сначала добавьте `LICENSE`.
