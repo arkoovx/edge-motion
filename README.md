@@ -90,6 +90,12 @@ journalctl -u edge-motion.service -f
 
 ### Безопасный способ подобрать комфортные значения
 
+- `--mode scroll` — включает режим скролла вместо движения курсора.
+- `--natural-scroll` — инвертирует вертикальный скролл (natural mode).
+- `--diagonal-scroll` — разрешает одновременно горизонталь+вертикаль в scroll-режиме.
+- `--two-finger-scroll` — edge-scroll только при двух активных пальцах.
+- `--deadzone 0.08` — центральная зона, где edge-режим не активируется.
+
 1. Меняйте **только один параметр за раз**.
 2. После изменения применяйте:
 
@@ -140,6 +146,7 @@ sudo /usr/local/bin/edge-motion --verbose
 
 ```bash
 /usr/local/bin/edge-motion --help
+/usr/local/bin/edge-motion --version
 ```
 
 ---
