@@ -6,7 +6,7 @@ SERVICE_NAME="${EDGE_MOTION_SERVICE_NAME:-edge-motion.service}"
 
 DEFAULT_ARGS=(
   --no-grab
-  --mode scroll
+  --mode motion
   --threshold 0.06
   --hold-ms 90
   --pulse-ms 12
@@ -111,7 +111,7 @@ save_and_restart() {
 menu_loop() {
   local mode threshold hold_ms pulse_ms pulse_step max_speed accel deadzone natural diagonal twofinger grab
 
-  mode="$(find_opt --mode "${CURRENT_ARGS[@]}" || echo scroll)"
+  mode="$(find_opt --mode "${CURRENT_ARGS[@]}" || echo motion)"
   threshold="$(find_opt --threshold "${CURRENT_ARGS[@]}" || echo 0.06)"
   hold_ms="$(find_opt --hold-ms "${CURRENT_ARGS[@]}" || echo 90)"
   pulse_ms="$(find_opt --pulse-ms "${CURRENT_ARGS[@]}" || echo 12)"
@@ -125,13 +125,30 @@ menu_loop() {
   if find_opt --grab "${CURRENT_ARGS[@]}" >/dev/null; then grab=1; else grab=0; fi
 
   while true; do
-    local prompt
-    prompt="Текущие значения:\nmode=$mode, threshold=$threshold, hold-ms=$hold_ms, pulse-ms=$pulse_ms\npulse-step=$pulse_step, max-speed=$max_speed, accel=$accel, deadzone=$deadzone\nnatural=$natural, diagonal=$diagonal, two-finger=$twofinger, grab=$grab"
+    local prompt mode_label natural_label diagonal_label twofinger_label grab_label
+    if [[ "$mode" == "motion" ]]; then mode_label="Курсор (motion)"; else mode_label="Скролл (scroll)"; fi
+    if [[ "$natural" == "1" ]]; then natural_label="Вкл"; else natural_label="Выкл"; fi
+    if [[ "$diagonal" == "1" ]]; then diagonal_label="Вкл"; else diagonal_label="Выкл"; fi
+    if [[ "$twofinger" == "1" ]]; then twofinger_label="Вкл"; else twofinger_label="Выкл"; fi
+    if [[ "$grab" == "1" ]]; then grab_label="Вкл"; else grab_label="Выкл"; fi
+
+    prompt="Режим: $mode_label\nthreshold=$threshold, hold-ms=$hold_ms, pulse-ms=$pulse_ms\npulse-step=$pulse_step, max-speed=$max_speed, accel=$accel, deadzone=$deadzone\nnatural=$natural_label, diagonal=$diagonal_label, two-finger=$twofinger_label, grab=$grab_label"
 
     local action
     if command -v whiptail >/dev/null 2>&1; then
-      action=$(whiptail --title "edge-motion: меню настройки" --menu "$prompt" 22 88 8 \
-        "edit" "Изменить параметры" \
+      action=$(whiptail --title "edge-motion: меню настройки" --menu "$prompt" 24 96 14 \
+        "mode" "Режим: $mode_label" \
+        "threshold" "Ширина краевой зоны: $threshold" \
+        "hold-ms" "Задержка перед стартом (мс): $hold_ms" \
+        "pulse-ms" "Интервал импульсов (мс): $pulse_ms" \
+        "pulse-step" "Базовый шаг импульса: $pulse_step" \
+        "max-speed" "Макс. скорость: $max_speed" \
+        "accel" "Степень ускорения: $accel" \
+        "deadzone" "Центральная мёртвая зона: $deadzone" \
+        "natural" "Natural scroll: $natural_label" \
+        "diagonal" "Диагональный скролл: $diagonal_label" \
+        "twofinger" "Скролл только 2 пальцами: $twofinger_label" \
+        "grab" "Эксклюзивный захват тачпада: $grab_label" \
         "save" "💾 Сохранить и перезапустить" \
         "reset" "↺ Сбросить на оптимальные значения" \
         "exit" "Выход без изменений" 3>&1 1>&2 2>&3) || action="exit"
@@ -141,32 +158,53 @@ menu_loop() {
     fi
 
     case "$action" in
-      edit)
+      mode)
+        if [[ "$mode" == "motion" ]]; then mode="scroll"; else mode="motion"; fi
+        ;;
+      threshold|hold-ms|pulse-ms|pulse-step|max-speed|accel|deadzone)
+        local current regex question entered
+        case "$action" in
+          threshold) current="$threshold"; regex='^[0-9]+(\.[0-9]+)?$'; question="Новая ширина краевой зоны (например 0.06):" ;;
+          hold-ms) current="$hold_ms"; regex='^[0-9]+$'; question="Новая задержка hold-ms в мс (например 90):" ;;
+          pulse-ms) current="$pulse_ms"; regex='^[0-9]+$'; question="Новый pulse-ms в мс (например 12):" ;;
+          pulse-step) current="$pulse_step"; regex='^[0-9]+(\.[0-9]+)?$'; question="Новый pulse-step (например 1.5):" ;;
+          max-speed) current="$max_speed"; regex='^[0-9]+(\.[0-9]+)?$'; question="Новая max-speed (например 2.4):" ;;
+          accel) current="$accel"; regex='^[0-9]+(\.[0-9]+)?$'; question="Новый accel-exponent (например 1.6):" ;;
+          deadzone) current="$deadzone"; regex='^[0-9]+(\.[0-9]+)?$'; question="Новая deadzone (например 0.07):" ;;
+        esac
+
         if command -v whiptail >/dev/null 2>&1; then
-          local form
-          form=$(whiptail --title "edge-motion: редактирование" --inputbox \
-"Введите через пробел:\nmode threshold hold-ms pulse-ms pulse-step max-speed accel deadzone natural(0/1) diagonal(0/1) twofinger(0/1) grab(0/1)\nПример: scroll 0.06 90 12 1.5 2.4 1.6 0.07 1 0 0 0" \
-            18 90 "$mode $threshold $hold_ms $pulse_ms $pulse_step $max_speed $accel $deadzone $natural $diagonal $twofinger $grab" \
-            3>&1 1>&2 2>&3) || continue
+          entered=$(whiptail --title "edge-motion: редактирование" --inputbox "$question" 11 78 "$current" 3>&1 1>&2 2>&3) || continue
         else
-          read -r -p "Введите параметры: " form
+          read -r -p "$question " entered
         fi
 
-        read -r mode threshold hold_ms pulse_ms pulse_step max_speed accel deadzone natural diagonal twofinger grab <<<"$form"
-
-        if ! validate '^(motion|scroll)$' "$mode" || \
-           ! validate '^[0-9]+(\.[0-9]+)?$' "$threshold" || \
-           ! validate '^[0-9]+$' "$hold_ms" || \
-           ! validate '^[0-9]+$' "$pulse_ms" || \
-           ! validate '^[0-9]+(\.[0-9]+)?$' "$pulse_step" || \
-           ! validate '^[0-9]+(\.[0-9]+)?$' "$max_speed" || \
-           ! validate '^[0-9]+(\.[0-9]+)?$' "$accel" || \
-           ! validate '^[0-9]+(\.[0-9]+)?$' "$deadzone" || \
-           ! validate '^[01]$' "$natural" || ! validate '^[01]$' "$diagonal" || \
-           ! validate '^[01]$' "$twofinger" || ! validate '^[01]$' "$grab"; then
-          msg "Ошибка в формате значений. Попробуйте снова."
+        if ! validate "$regex" "$entered"; then
+          msg "Ошибка в формате значения. Попробуйте снова."
           continue
         fi
+
+        case "$action" in
+          threshold) threshold="$entered" ;;
+          hold-ms) hold_ms="$entered" ;;
+          pulse-ms) pulse_ms="$entered" ;;
+          pulse-step) pulse_step="$entered" ;;
+          max-speed) max_speed="$entered" ;;
+          accel) accel="$entered" ;;
+          deadzone) deadzone="$entered" ;;
+        esac
+        ;;
+      natural)
+        if [[ "$natural" == "1" ]]; then natural="0"; else natural="1"; fi
+        ;;
+      diagonal)
+        if [[ "$diagonal" == "1" ]]; then diagonal="0"; else diagonal="1"; fi
+        ;;
+      twofinger)
+        if [[ "$twofinger" == "1" ]]; then twofinger="0"; else twofinger="1"; fi
+        ;;
+      grab)
+        if [[ "$grab" == "1" ]]; then grab="0"; else grab="1"; fi
         ;;
       save)
         build_args "$mode" "$threshold" "$hold_ms" "$pulse_ms" "$pulse_step" "$max_speed" "$accel" "$deadzone" "$natural" "$diagonal" "$twofinger" "$grab"
@@ -179,7 +217,7 @@ menu_loop() {
       reset)
         if confirm "Сбросить параметры на оптимальные значения по умолчанию?"; then
           CURRENT_ARGS=("${DEFAULT_ARGS[@]}")
-          mode="scroll"; threshold="0.06"; hold_ms="90"; pulse_ms="12"; pulse_step="1.5"
+          mode="motion"; threshold="0.06"; hold_ms="90"; pulse_ms="12"; pulse_step="1.5"
           max_speed="2.4"; accel="1.6"; deadzone="0.07"; natural="0"; diagonal="0"; twofinger="0"; grab="0"
           msg "Значения сброшены. Нажмите Save для применения."
         fi
