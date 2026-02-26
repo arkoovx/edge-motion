@@ -272,8 +272,7 @@ static int load_config_file(const char *path)
         char *p = line;
         while (*p == ' ' || *p == '	')
             p++;
-        if (*p == '\0' || *p == '
-' || *p == '#')
+        if (*p == '\0' || *p == '\n' || *p == '#')
             continue;
 
         char *eq = strchr(p, '=');
@@ -288,10 +287,11 @@ static int load_config_file(const char *path)
             *--kend = '\0';
         while (*value == ' ' || *value == '	')
             value++;
+
         char *vend = value + strlen(value);
-        while (vend > value && (vend[-1] == '
-' || vend[-1] == '' || vend[-1] == ' ' || vend[-1] == '	'))
-            *--vend = '\0';
+        while (vend > value &&
+               (vend[-1] == '\n' || vend[-1] == '\r' || vend[-1] == ' ' || vend[-1] == '	'))
+            fprintf(stderr, "Invalid config option at %s:%d -> %s\n", path, line_no, key);
 
         if (apply_config_option(key, value) < 0) {
             fprintf(stderr, "Invalid config option at %s:%d -> %s
