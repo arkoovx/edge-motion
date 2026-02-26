@@ -104,6 +104,24 @@ validate() {
   [[ "$value" =~ $regex ]]
 }
 
+validate_ranges() {
+  local mode_v="$1" threshold_v="$2" hold_v="$3" pulse_v="$4" step_v="$5" max_v="$6" accel_v="$7" deadzone_v="$8"
+
+  awk -v mode="$mode_v" -v t="$threshold_v" -v h="$hold_v" -v p="$pulse_v" -v s="$step_v" -v m="$max_v" -v a="$accel_v" -v d="$deadzone_v" '
+    BEGIN {
+      if (mode != "motion" && mode != "scroll") exit 10;
+      if (!(t >= 0 && t <= 0.49)) exit 11;
+      if (!(h >= 0 && h <= 5000)) exit 12;
+      if (!(p >= 1 && p <= 500)) exit 13;
+      if (!(s > 0 && s <= 10)) exit 14;
+      if (!(m > 0 && m <= 20)) exit 15;
+      if (!(a >= 1 && a <= 6)) exit 16;
+      if (!(d >= 0 && d <= 0.49)) exit 17;
+      exit 0;
+    }
+  '
+}
+
 to_scaled_int() {
   local value="$1" scale="$2"
   awk -v v="$value" -v s="$scale" 'BEGIN { printf "%d", (v * s + 0.5) }'
@@ -195,6 +213,11 @@ zenity_numeric_form() {
     return 1
   fi
 
+  if ! validate_ranges "$mode" "$th" "$hm" "$pm" "$ps" "$ms" "$ac" "$dz"; then
+    msg "Часть значений вне допустимого диапазона.\nthreshold/deadzone: 0..0.49, hold-ms: 0..5000, pulse-ms: 1..500, pulse-step: >0..10, max-speed: >0..20, accel: 1..6"
+    return 1
+  fi
+
   threshold="$th"
   hold_ms="$hm"
   pulse_ms="$pm"
@@ -268,6 +291,10 @@ run_zenity_ui() {
         fi
         ;;
       "Сохранить и перезапустить")
+        if ! validate_ranges "$mode" "$threshold" "$hold_ms" "$pulse_ms" "$pulse_step" "$max_speed" "$accel" "$deadzone"; then
+          msg "Проверьте диапазоны числовых параметров перед сохранением."
+          continue
+        fi
         build_args "$mode" "$threshold" "$hold_ms" "$pulse_ms" "$pulse_step" "$max_speed" "$accel" "$deadzone" "$natural" "$diagonal" "$twofinger" "$grab"
         if confirm "Сохранить и перезапустить сервис?"; then
           save_and_restart
@@ -341,15 +368,30 @@ run_text_ui() {
           msg "Ошибка в формате значения. Попробуйте снова."
           continue
         fi
+        local new_threshold="$threshold" new_hold_ms="$hold_ms" new_pulse_ms="$pulse_ms" new_pulse_step="$pulse_step" new_max_speed="$max_speed" new_accel="$accel" new_deadzone="$deadzone"
+        case "$action" in
+          threshold) new_threshold="$entered" ;;
+          hold-ms) new_hold_ms="$entered" ;;
+          pulse-ms) new_pulse_ms="$entered" ;;
+          pulse-step) new_pulse_step="$entered" ;;
+          max-speed) new_max_speed="$entered" ;;
+          accel) new_accel="$entered" ;;
+          deadzone) new_deadzone="$entered" ;;
+        esac
+
+        if ! validate_ranges "$mode" "$new_threshold" "$new_hold_ms" "$new_pulse_ms" "$new_pulse_step" "$new_max_speed" "$new_accel" "$new_deadzone"; then
+          msg "Значение вне диапазона. Проверьте limits в подсказке."
+          continue
+        fi
 
         case "$action" in
-          threshold) threshold="$entered" ;;
-          hold-ms) hold_ms="$entered" ;;
-          pulse-ms) pulse_ms="$entered" ;;
-          pulse-step) pulse_step="$entered" ;;
-          max-speed) max_speed="$entered" ;;
-          accel) accel="$entered" ;;
-          deadzone) deadzone="$entered" ;;
+          threshold) threshold="$new_threshold" ;;
+          hold-ms) hold_ms="$new_hold_ms" ;;
+          pulse-ms) pulse_ms="$new_pulse_ms" ;;
+          pulse-step) pulse_step="$new_pulse_step" ;;
+          max-speed) max_speed="$new_max_speed" ;;
+          accel) accel="$new_accel" ;;
+          deadzone) deadzone="$new_deadzone" ;;
         esac
         ;;
       natural) [[ "$natural" == "1" ]] && natural="0" || natural="1" ;;
@@ -357,6 +399,10 @@ run_text_ui() {
       twofinger) [[ "$twofinger" == "1" ]] && twofinger="0" || twofinger="1" ;;
       grab) [[ "$grab" == "1" ]] && grab="0" || grab="1" ;;
       save)
+        if ! validate_ranges "$mode" "$threshold" "$hold_ms" "$pulse_ms" "$pulse_step" "$max_speed" "$accel" "$deadzone"; then
+          msg "Проверьте диапазоны числовых параметров перед сохранением."
+          continue
+        fi
         build_args "$mode" "$threshold" "$hold_ms" "$pulse_ms" "$pulse_step" "$max_speed" "$accel" "$deadzone" "$natural" "$diagonal" "$twofinger" "$grab"
         if confirm "Сохранить и выполнить автоперезапуск сервиса с новыми параметрами?"; then
           save_and_restart
