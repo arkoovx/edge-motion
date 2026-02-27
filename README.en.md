@@ -28,3 +28,7 @@ Auto-update config file:
 - `/etc/default/edge-motion-update`
 
 For detailed usage examples and tuning profiles, see the Russian guide in `README.ru.md` (until a full English manual is added).
+
+Notes:
+- Newer versions include stricter touchpad auto-selection (helps avoid mouse/touchpad conflicts after reboot).
+- You can suppress accidental edge scrolling in the physical click area with `--button-zone` and `--button-cooldown-ms`.

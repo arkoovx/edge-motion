@@ -21,7 +21,7 @@
 #include <libudev.h>
 #include <unistd.h>
 
-#define EDGE_MOTION_VERSION "1.3.0"
+#define EDGE_MOTION_VERSION "1.3.1"
 
 #define DEFAULT_EDGE_THRESHOLD 0.06
 #define DEFAULT_EDGE_HYSTERESIS 0.015
@@ -36,6 +36,8 @@
 #define DEFAULT_MAX_RSS_MB 256
 #define DEFAULT_MAX_CPU_PERCENT 90.0
 #define DEFAULT_RESOURCE_GRACE_CHECKS 5
+#define DEFAULT_BUTTON_ZONE 0.14
+#define DEFAULT_BUTTON_COOLDOWN_MS 180
 
 static double edge_threshold = DEFAULT_EDGE_THRESHOLD;
 static double edge_hysteresis = DEFAULT_EDGE_HYSTERESIS;
@@ -62,6 +64,8 @@ static int resource_guard_enabled = 1;
 static int max_rss_mb = DEFAULT_MAX_RSS_MB;
 static double max_cpu_percent = DEFAULT_MAX_CPU_PERCENT;
 static int resource_grace_checks = DEFAULT_RESOURCE_GRACE_CHECKS;
+static double button_zone = DEFAULT_BUTTON_ZONE;
+static int button_cooldown_ms = DEFAULT_BUTTON_COOLDOWN_MS;
 static char **ignored_devnodes = NULL;
 static size_t ignored_devnode_count = 0;
 
@@ -106,6 +110,9 @@ struct touchpad_candidate {
     int min_y;
     int max_y;
     long long area;
+    int has_finger_tool;
+    int has_btn_touch;
+    int is_mouse_like;
 };
 
 struct resource_guard_state {
@@ -423,6 +430,10 @@ static int apply_config_option(const char *key, const char *value)
         return parse_double_arg(value, &accel_exponent);
     if (strcmp(key, "pressure-boost") == 0)
         return parse_double_arg(value, &pressure_boost);
+    if (strcmp(key, "button-zone") == 0)
+        return parse_double_arg(value, &button_zone);
+    if (strcmp(key, "button-cooldown-ms") == 0)
+        return parse_int_arg(value, &button_cooldown_ms);
 
     return -1;
 }
@@ -668,6 +679,15 @@ static int enumerate_touchpad_candidates(struct touchpad_candidate **out_items, 
 
                     if (absx && absy && absx->maximum >= absx->minimum &&
                         absy->maximum >= absy->minimum) {
+                        int has_finger_tool = libevdev_has_event_code(evdev, EV_KEY, BTN_TOOL_FINGER);
+                        int has_btn_touch = libevdev_has_event_code(evdev, EV_KEY, BTN_TOUCH);
+                        if (!has_finger_tool && !has_btn_touch) {
+                            libevdev_free(evdev);
+                            close(fd);
+                            udev_device_unref(dev);
+                            continue;
+                        }
+
                         const char *device_name = libevdev_get_name(evdev) ? libevdev_get_name(evdev)
                                                                           : "unknown";
                         char *devnode_copy = strdup(devnode);
@@ -696,6 +716,13 @@ static int enumerate_touchpad_candidates(struct touchpad_candidate **out_items, 
                                 long long range_y =
                                     (long long)absy->maximum - (long long)absy->minimum;
                                 items[count].area = range_x * range_y;
+                                items[count].has_finger_tool = has_finger_tool ? 1 : 0;
+                                items[count].has_btn_touch = has_btn_touch ? 1 : 0;
+                                items[count].is_mouse_like =
+                                    libevdev_has_event_code(evdev, EV_REL, REL_X) &&
+                                            libevdev_has_event_code(evdev, EV_REL, REL_Y)
+                                        ? 1
+                                        : 0;
                                 count++;
                             } else {
                                 free(devnode_copy);
@@ -766,8 +793,14 @@ static char *find_touchpad_devnode(void)
     for (size_t i = 1; i < count; i++) {
         int better_integrated = items[i].integrated > items[best].integrated;
         int same_integrated = items[i].integrated == items[best].integrated;
+        int better_tool = items[i].has_finger_tool > items[best].has_finger_tool;
+        int same_tool = items[i].has_finger_tool == items[best].has_finger_tool;
+        int less_mouse_like = items[i].is_mouse_like < items[best].is_mouse_like;
+        int same_mouse_like = items[i].is_mouse_like == items[best].is_mouse_like;
         int better_area = items[i].area > items[best].area;
-        if (better_integrated || (same_integrated && better_area))
+        if (better_integrated ||
+            (same_integrated &&
+             (better_tool || (same_tool && (less_mouse_like || (same_mouse_like && better_area))))))
             best = i;
     }
 
@@ -1006,6 +1039,10 @@ static void print_usage(const char *prog)
     printf("                           Scroll axis preference without diagonal mode\n");
     printf("  --accel-exponent <n>     Non-linear edge depth acceleration (default 1.0)\n");
     printf("  --pressure-boost <0-2>   Extra speed from touch pressure (default 0)\n");
+    printf("  --button-zone <0-0.4>    Disable edge motion near bottom button area (default %.2f)\n",
+           DEFAULT_BUTTON_ZONE);
+    printf("  --button-cooldown-ms <ms> Suppress edge motion shortly after click (default %d)\n",
+           DEFAULT_BUTTON_COOLDOWN_MS);
     printf("  --grab / --no-grab       Exclusive grab (can disable normal touchpad input) / shared mode\n");
     printf("  --device </dev/input/eventX>  Force touchpad device\n");
     printf("  --ignore </dev/input/eventX>  Ignore device (can be repeated)\n");
@@ -1030,6 +1067,8 @@ enum {
     OPT_SCROLL_AXIS_PRIORITY,
     OPT_ACCEL_EXPONENT,
     OPT_PRESSURE_BOOST,
+    OPT_BUTTON_ZONE,
+    OPT_BUTTON_COOLDOWN_MS,
     OPT_IGNORE,
     OPT_DAEMON,
     OPT_CONFIG,
@@ -1063,6 +1102,8 @@ int main(int argc, char **argv)
         {"scroll-axis-priority", required_argument, NULL, OPT_SCROLL_AXIS_PRIORITY},
         {"accel-exponent", required_argument, NULL, OPT_ACCEL_EXPONENT},
         {"pressure-boost", required_argument, NULL, OPT_PRESSURE_BOOST},
+        {"button-zone", required_argument, NULL, OPT_BUTTON_ZONE},
+        {"button-cooldown-ms", required_argument, NULL, OPT_BUTTON_COOLDOWN_MS},
         {"grab", no_argument, NULL, 'g'},
         {"no-grab", no_argument, NULL, 'G'},
         {"device", required_argument, NULL, 'd'},
@@ -1193,6 +1234,18 @@ int main(int argc, char **argv)
                 return 2;
             }
             break;
+        case OPT_BUTTON_ZONE:
+            if (parse_double_arg(optarg, &button_zone) < 0) {
+                fprintf(stderr, "Invalid button-zone: %s\n", optarg);
+                return 2;
+            }
+            break;
+        case OPT_BUTTON_COOLDOWN_MS:
+            if (parse_int_arg(optarg, &button_cooldown_ms) < 0) {
+                fprintf(stderr, "Invalid button-cooldown-ms: %s\n", optarg);
+                return 2;
+            }
+            break;
         case 'g':
             use_grab = 1;
             break;
@@ -1274,8 +1327,8 @@ int main(int argc, char **argv)
         threshold_left < 0.01 || threshold_left > 0.5 || threshold_right < 0.01 ||
         threshold_right > 0.5 || threshold_top < 0.01 || threshold_top > 0.5 ||
         threshold_bottom < 0.01 || threshold_bottom > 0.5 || accel_exponent < 0.0 ||
-        pressure_boost < 0.0 || pressure_boost > 2.0 || max_rss_mb < 0 || max_cpu_percent < 0.0 ||
-        resource_grace_checks < 1) {
+        pressure_boost < 0.0 || pressure_boost > 2.0 || button_zone < 0.0 || button_zone > 0.4 ||
+        button_cooldown_ms < 0 || max_rss_mb < 0 || max_cpu_percent < 0.0 || resource_grace_checks < 1) {
         fprintf(stderr, "Invalid arguments. See --help.\n");
         return 2;
     }
@@ -1359,6 +1412,8 @@ int main(int argc, char **argv)
     int pressure_min = 0, pressure_max = 0;
     int last_pressure = -1;
     int invalid_axes_logged = 0;
+    int click_button_down = 0;
+    int64_t edge_suppress_until_ms = 0;
     struct timespec edge_enter_time = {0};
 
     read_pressure_range(tp.dev, &pressure_min, &pressure_max);
@@ -1383,6 +1438,8 @@ int main(int argc, char **argv)
 
         double speed_factor = 0.0;
         int two_finger_ok = !(mode == EM_MODE_SCROLL && two_finger_scroll) || active_fingers >= 2;
+        int64_t now_ms_for_suppression = monotonic_now_ms();
+        int in_button_cooldown = now_ms_for_suppression < edge_suppress_until_ms;
         if (max_x <= min_x || max_y <= min_y) {
             if (verbose && !invalid_axes_logged) {
                 fprintf(stderr,
@@ -1401,9 +1458,14 @@ int main(int argc, char **argv)
         }
         invalid_axes_logged = 0;
 
-        if (last_x >= 0 && last_y >= 0 && two_finger_ok) {
+        if (last_x >= 0 && last_y >= 0 && two_finger_ok && !click_button_down && !in_button_cooldown) {
             double nx = (double)(last_x - min_x) / (double)(max_x - min_x);
             double ny = (double)(last_y - min_y) / (double)(max_y - min_y);
+            int in_button_zone = ny >= (1.0 - button_zone);
+            if (in_button_zone) {
+                nx = 0.5;
+                ny = 0.5;
+            }
             if (nx > 0.5 - deadzone && nx < 0.5 + deadzone)
                 nx = 0.5;
             if (ny > 0.5 - deadzone && ny < 0.5 + deadzone)
@@ -1588,6 +1650,14 @@ int main(int argc, char **argv)
                             }
                         }
                     } else if (ev.type == EV_KEY &&
+                               (ev.code == BTN_LEFT || ev.code == BTN_RIGHT || ev.code == BTN_MIDDLE)) {
+                        if (ev.value > 0) {
+                            click_button_down = 1;
+                        } else {
+                            click_button_down = 0;
+                        }
+                        edge_suppress_until_ms = monotonic_now_ms() + button_cooldown_ms;
+                    } else if (ev.type == EV_KEY &&
                                ((ev.code == BTN_TOUCH || ev.code == BTN_TOOL_FINGER ||
                                  ev.code == BTN_TOOL_PEN || ev.code == BTN_TOOL_MOUSE) &&
                                 ev.value == 0)) {
@@ -1646,6 +1716,7 @@ int main(int argc, char **argv)
                 was_in_edge_y = 0;
                 touchpad_available = 0;
                 active_fingers = 0;
+                click_button_down = 0;
                 cleanup_touchpad_resources(&tp);
                 pfd.fd = -1;
                 struct timespec now;
@@ -1677,6 +1748,7 @@ int main(int argc, char **argv)
                     current_slot = 0;
                     preferred_slot = -1;
                     active_fingers = 0;
+                    click_button_down = 0;
                     last_pressure = -1;
                     last_x = -1;
                     last_y = -1;
