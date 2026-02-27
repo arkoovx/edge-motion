@@ -21,7 +21,7 @@
 #include <libudev.h>
 #include <unistd.h>
 
-#define EDGE_MOTION_VERSION "1.3.1"
+#define EDGE_MOTION_VERSION "1.3.2"
 
 #define DEFAULT_EDGE_THRESHOLD 0.06
 #define DEFAULT_EDGE_HYSTERESIS 0.015
@@ -1046,7 +1046,7 @@ static void print_usage(const char *prog)
     printf("  --threshold-left <0.01-0.5>   Left edge threshold override\n");
     printf("  --threshold-right <0.01-0.5>  Right edge threshold override\n");
     printf("  --threshold-top <0.01-0.5>    Top edge threshold override\n");
-    printf("  --threshold-bottom <0.01-0.5> Bottom edge threshold override\n");
+    printf("  --threshold-bottom <0.0-0.5>  Bottom edge threshold override (0 disables bottom edge)\n");
     printf("  --hysteresis <0.0-0.2>   Edge hysteresis (default %.3f)\n", DEFAULT_EDGE_HYSTERESIS);
     printf("  --hold-ms <ms>           Hold delay before activation (default %d)\n", DEFAULT_HOLD_MS);
     printf("  --pulse-ms <ms>          Pulse interval (default %d)\n", DEFAULT_PULSE_MS);
@@ -1350,13 +1350,13 @@ int main(int argc, char **argv)
     if (threshold_top < 0.0)
         threshold_top = edge_threshold;
     if (threshold_bottom < 0.0)
-        threshold_bottom = edge_threshold;
+        threshold_bottom = 0.0;
 
     if (edge_threshold < 0.01 || edge_threshold > 0.5 || edge_hysteresis < 0.0 || hold_ms < 0 ||
         pulse_ms <= 0 || pulse_step <= 0 || max_speed < 1.0 || deadzone < 0.0 || deadzone >= 0.5 ||
         threshold_left < 0.01 || threshold_left > 0.5 || threshold_right < 0.01 ||
         threshold_right > 0.5 || threshold_top < 0.01 || threshold_top > 0.5 ||
-        threshold_bottom < 0.01 || threshold_bottom > 0.5 || accel_exponent < 0.0 ||
+        threshold_bottom < 0.0 || threshold_bottom > 0.5 || accel_exponent < 0.0 ||
         pressure_boost < 0.0 || pressure_boost > 2.0 || button_zone < 0.0 || button_zone > 0.4 ||
         button_cooldown_ms < 0 || max_rss_mb < 0 || max_cpu_percent < 0.0 || resource_grace_checks < 1) {
         fprintf(stderr, "Invalid arguments. See --help.\n");
@@ -1552,14 +1552,14 @@ int main(int argc, char **argv)
             }
 
             if (was_in_edge_y) {
-                if (ny >= 1.0 - bottom_leave)
+                if (bottom_enter > 0.0 && ny >= 1.0 - bottom_leave)
                     dy = 1;
                 else if (ny <= top_leave)
                     dy = -1;
             }
 
             if (!dy) {
-                if (ny >= 1.0 - bottom_enter)
+                if (bottom_enter > 0.0 && ny >= 1.0 - bottom_enter)
                     dy = 1;
                 else if (ny <= top_enter)
                     dy = -1;
@@ -1570,7 +1570,7 @@ int main(int argc, char **argv)
             else if (nx <= left_enter)
                 depth_x = (left_enter - nx) / left_enter;
 
-            if (ny >= 1.0 - bottom_enter)
+            if (bottom_enter > 0.0 && ny >= 1.0 - bottom_enter)
                 depth_y = (ny - (1.0 - bottom_enter)) / bottom_enter;
             else if (ny <= top_enter)
                 depth_y = (top_enter - ny) / top_enter;
