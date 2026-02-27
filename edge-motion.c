@@ -38,6 +38,7 @@
 #define DEFAULT_RESOURCE_GRACE_CHECKS 5
 #define DEFAULT_BUTTON_ZONE 0.14
 #define DEFAULT_BUTTON_COOLDOWN_MS 180
+#define BUTTON_ZONE_EXIT_HYSTERESIS 0.02
 
 static double edge_threshold = DEFAULT_EDGE_THRESHOLD;
 static double edge_hysteresis = DEFAULT_EDGE_HYSTERESIS;
@@ -1415,6 +1416,7 @@ int main(int argc, char **argv)
     int click_button_down = 0;
     int64_t edge_suppress_until_ms = 0;
     struct timespec edge_enter_time = {0};
+    int button_zone_latched = 0;
 
     read_pressure_range(tp.dev, &pressure_min, &pressure_max);
 
@@ -1458,11 +1460,23 @@ int main(int argc, char **argv)
         }
         invalid_axes_logged = 0;
 
-        if (last_x >= 0 && last_y >= 0 && two_finger_ok && !click_button_down && !in_button_cooldown) {
+        if (last_x >= 0 && last_y >= 0 && two_finger_ok && !click_button_down) {
             double nx = (double)(last_x - min_x) / (double)(max_x - min_x);
             double ny = (double)(last_y - min_y) / (double)(max_y - min_y);
-            int in_button_zone = ny >= (1.0 - button_zone);
-            if (in_button_zone) {
+
+            double button_zone_enter_ny = 1.0 - button_zone;
+            double button_zone_exit_ny = button_zone_enter_ny - BUTTON_ZONE_EXIT_HYSTERESIS;
+            if (button_zone_exit_ny < 0.0)
+                button_zone_exit_ny = 0.0;
+
+            if (ny >= button_zone_enter_ny) {
+                button_zone_latched = 1;
+                edge_suppress_until_ms = now_ms_for_suppression + button_cooldown_ms;
+            } else if (button_zone_latched && ny < button_zone_exit_ny) {
+                button_zone_latched = 0;
+            }
+
+            if (button_zone_latched || in_button_cooldown) {
                 nx = 0.5;
                 ny = 0.5;
             }
@@ -1559,6 +1573,7 @@ int main(int argc, char **argv)
             was_in_edge = 0;
             was_in_edge_x = 0;
             was_in_edge_y = 0;
+            button_zone_latched = 0;
         }
 
         pthread_mutex_lock(&state.lock);
@@ -1653,6 +1668,7 @@ int main(int argc, char **argv)
                                (ev.code == BTN_LEFT || ev.code == BTN_RIGHT || ev.code == BTN_MIDDLE)) {
                         if (ev.value > 0) {
                             click_button_down = 1;
+                            button_zone_latched = 0;
                         } else {
                             click_button_down = 0;
                         }
@@ -1667,6 +1683,7 @@ int main(int argc, char **argv)
                         was_in_edge = 0;
                         was_in_edge_x = 0;
                         was_in_edge_y = 0;
+                        button_zone_latched = 0;
                         preferred_slot = -1;
                         active_fingers = 0;
                         for (int i = 0; i < slot_count; i++) {
@@ -1717,6 +1734,7 @@ int main(int argc, char **argv)
                 touchpad_available = 0;
                 active_fingers = 0;
                 click_button_down = 0;
+                button_zone_latched = 0;
                 cleanup_touchpad_resources(&tp);
                 pfd.fd = -1;
                 struct timespec now;
@@ -1749,6 +1767,7 @@ int main(int argc, char **argv)
                     preferred_slot = -1;
                     active_fingers = 0;
                     click_button_down = 0;
+                    button_zone_latched = 0;
                     last_pressure = -1;
                     last_x = -1;
                     last_y = -1;
