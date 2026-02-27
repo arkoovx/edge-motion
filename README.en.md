@@ -31,4 +31,5 @@ For detailed usage examples and tuning profiles, see the Russian guide in `READM
 
 Notes:
 - Newer versions include stricter touchpad auto-selection (helps avoid mouse/touchpad conflicts after reboot).
-- You can suppress accidental edge scrolling in the physical click area with `--button-zone` and `--button-cooldown-ms`.
+- Bottom edge activation is disabled by default (`--threshold-bottom 0.0`) so clicks in the lower area are not disturbed.
+- You can additionally suppress accidental edge scrolling in the physical click area with `--button-zone` and `--button-cooldown-ms`.
