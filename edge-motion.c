@@ -36,9 +36,9 @@
 #define DEFAULT_MAX_RSS_MB 256
 #define DEFAULT_MAX_CPU_PERCENT 90.0
 #define DEFAULT_RESOURCE_GRACE_CHECKS 5
-#define DEFAULT_BUTTON_ZONE 0.14
-#define DEFAULT_BUTTON_COOLDOWN_MS 180
-#define BUTTON_ZONE_EXIT_HYSTERESIS 0.02
+#define DEFAULT_BUTTON_ZONE 0.165
+#define DEFAULT_BUTTON_COOLDOWN_MS 280
+#define BUTTON_ZONE_EXIT_HYSTERESIS 0.025
 
 static double edge_threshold = DEFAULT_EDGE_THRESHOLD;
 static double edge_hysteresis = DEFAULT_EDGE_HYSTERESIS;
@@ -67,8 +67,10 @@ static double max_cpu_percent = DEFAULT_MAX_CPU_PERCENT;
 static int resource_grace_checks = DEFAULT_RESOURCE_GRACE_CHECKS;
 static double button_zone = DEFAULT_BUTTON_ZONE;
 static int button_cooldown_ms = DEFAULT_BUTTON_COOLDOWN_MS;
+static int button_zone_enabled = 1;
 static char **ignored_devnodes = NULL;
 static size_t ignored_devnode_count = 0;
+static int uinput_fd = -1;
 
 enum em_mode {
     EM_MODE_MOTION = 0,
@@ -340,8 +342,8 @@ static int check_resource_limits(struct resource_guard_state *guard)
             char msg[512];
             snprintf(msg,
                      sizeof(msg),
-                     "edge-motion остановлен: повышенное потребление ресурсов.\n"
-                     "CPU: %.1f%% (лимит %.1f%%), RSS: %.1f MB (лимит %d MB).",
+                     "edge-motion stopped: high resource usage.\n"
+                     "CPU: %.1f%% (limit %.1f%%), RSS: %.1f MB (limit %d MB).",
                      cpu_percent,
                      max_cpu_percent,
                      rss_kb > 0 ? (double)rss_kb / 1024.0 : -1.0,
@@ -433,6 +435,13 @@ static int apply_config_option(const char *key, const char *value)
         return parse_double_arg(value, &pressure_boost);
     if (strcmp(key, "button-zone") == 0)
         return parse_double_arg(value, &button_zone);
+    if (strcmp(key, "no-button-zone") == 0) {
+        int disabled = 0;
+        if (parse_bool_arg(value, &disabled) < 0)
+            return -1;
+        button_zone_enabled = !disabled;
+        return 0;
+    }
     if (strcmp(key, "button-cooldown-ms") == 0)
         return parse_int_arg(value, &button_cooldown_ms);
 
@@ -689,6 +698,25 @@ static int enumerate_touchpad_candidates(struct touchpad_candidate **out_items, 
                             continue;
                         }
 
+                        int integrated =
+                            udev_device_get_property_value(dev, "ID_INPUT_TOUCHPAD_INTEGRATED") &&
+                                    strcmp(udev_device_get_property_value(dev,
+                                                                          "ID_INPUT_TOUCHPAD_INTEGRATED"),
+                                           "1") == 0
+                                ? 1
+                                : 0;
+                        int is_mouse_like =
+                            libevdev_has_event_code(evdev, EV_REL, REL_X) &&
+                                    libevdev_has_event_code(evdev, EV_REL, REL_Y)
+                                ? 1
+                                : 0;
+                        if (is_mouse_like && !integrated) {
+                            libevdev_free(evdev);
+                            close(fd);
+                            udev_device_unref(dev);
+                            continue;
+                        }
+
                         const char *device_name = libevdev_get_name(evdev) ? libevdev_get_name(evdev)
                                                                           : "unknown";
                         char *devnode_copy = strdup(devnode);
@@ -700,14 +728,7 @@ static int enumerate_touchpad_candidates(struct touchpad_candidate **out_items, 
                                 items = tmp;
                                 items[count].devnode = devnode_copy;
                                 items[count].name = name_copy;
-                                items[count].integrated =
-                                    udev_device_get_property_value(dev,
-                                                                   "ID_INPUT_TOUCHPAD_INTEGRATED") &&
-                                            strcmp(udev_device_get_property_value(
-                                                       dev, "ID_INPUT_TOUCHPAD_INTEGRATED"),
-                                                   "1") == 0
-                                        ? 1
-                                        : 0;
+                                items[count].integrated = integrated;
                                 items[count].min_x = absx->minimum;
                                 items[count].max_x = absx->maximum;
                                 items[count].min_y = absy->minimum;
@@ -719,11 +740,7 @@ static int enumerate_touchpad_candidates(struct touchpad_candidate **out_items, 
                                 items[count].area = range_x * range_y;
                                 items[count].has_finger_tool = has_finger_tool ? 1 : 0;
                                 items[count].has_btn_touch = has_btn_touch ? 1 : 0;
-                                items[count].is_mouse_like =
-                                    libevdev_has_event_code(evdev, EV_REL, REL_X) &&
-                                            libevdev_has_event_code(evdev, EV_REL, REL_Y)
-                                        ? 1
-                                        : 0;
+                                items[count].is_mouse_like = is_mouse_like;
                                 count++;
                             } else {
                                 free(devnode_copy);
@@ -916,7 +933,8 @@ static void get_timeout_timespec(struct timespec *ts, int ms)
 
 static void *pulser_thread(void *arg)
 {
-    int ufd = (int)(intptr_t)arg;
+    (void)arg;
+    int ufd = uinput_fd;
 
     pthread_mutex_lock(&state.lock);
     while (running) {
@@ -934,8 +952,10 @@ static void *pulser_thread(void *arg)
 
         int err = 0;
         if (edge_active && (dx || dy)) {
-            if (ufd < 0)
+            if (ufd < 0) {
                 ufd = create_uinput_device();
+                uinput_fd = ufd;
+            }
             if (ufd < 0) {
                 err = -1;
                 goto relock;
@@ -991,6 +1011,7 @@ relock:
                 ioctl(ufd, UI_DEV_DESTROY);
                 close(ufd);
                 ufd = -1;
+                uinput_fd = -1;
             }
             state.edge_active = 0;
             state.dir_x = 0;
@@ -1010,6 +1031,7 @@ relock:
     if (ufd >= 0) {
         ioctl(ufd, UI_DEV_DESTROY);
         close(ufd);
+        uinput_fd = -1;
     }
 
     return NULL;
@@ -1040,8 +1062,9 @@ static void print_usage(const char *prog)
     printf("                           Scroll axis preference without diagonal mode\n");
     printf("  --accel-exponent <n>     Non-linear edge depth acceleration (default 1.0)\n");
     printf("  --pressure-boost <0-2>   Extra speed from touch pressure (default 0)\n");
-    printf("  --button-zone <0-0.4>    Disable edge motion near bottom button area (default %.2f)\n",
+    printf("  --button-zone <0-0.4>    Disable edge motion near bottom button area (default %.3f)\n",
            DEFAULT_BUTTON_ZONE);
+    printf("  --no-button-zone       Disable bottom button-zone suppression\n");
     printf("  --button-cooldown-ms <ms> Suppress edge motion shortly after click (default %d)\n",
            DEFAULT_BUTTON_COOLDOWN_MS);
     printf("  --grab / --no-grab       Exclusive grab (can disable normal touchpad input) / shared mode\n");
@@ -1069,6 +1092,7 @@ enum {
     OPT_ACCEL_EXPONENT,
     OPT_PRESSURE_BOOST,
     OPT_BUTTON_ZONE,
+    OPT_NO_BUTTON_ZONE,
     OPT_BUTTON_COOLDOWN_MS,
     OPT_IGNORE,
     OPT_DAEMON,
@@ -1104,6 +1128,7 @@ int main(int argc, char **argv)
         {"accel-exponent", required_argument, NULL, OPT_ACCEL_EXPONENT},
         {"pressure-boost", required_argument, NULL, OPT_PRESSURE_BOOST},
         {"button-zone", required_argument, NULL, OPT_BUTTON_ZONE},
+        {"no-button-zone", no_argument, NULL, OPT_NO_BUTTON_ZONE},
         {"button-cooldown-ms", required_argument, NULL, OPT_BUTTON_COOLDOWN_MS},
         {"grab", no_argument, NULL, 'g'},
         {"no-grab", no_argument, NULL, 'G'},
@@ -1240,6 +1265,10 @@ int main(int argc, char **argv)
                 fprintf(stderr, "Invalid button-zone: %s\n", optarg);
                 return 2;
             }
+            button_zone_enabled = 1;
+            break;
+        case OPT_NO_BUTTON_ZONE:
+            button_zone_enabled = 0;
             break;
         case OPT_BUTTON_COOLDOWN_MS:
             if (parse_int_arg(optarg, &button_cooldown_ms) < 0) {
@@ -1374,8 +1403,8 @@ int main(int argc, char **argv)
 
     int cond_initialized = 0;
 
-    int ufd = create_uinput_device();
-    if (ufd < 0) {
+    uinput_fd = create_uinput_device();
+    if (uinput_fd < 0) {
         fprintf(stderr, "Failed to create uinput (requires root/cap_sys_admin).\n");
         goto cleanup;
     }
@@ -1393,7 +1422,7 @@ int main(int argc, char **argv)
 
     pthread_t thr;
     int thread_started = 0;
-    if (pthread_create(&thr, NULL, pulser_thread, (void *)(intptr_t)ufd) != 0) {
+    if (pthread_create(&thr, NULL, pulser_thread, NULL) != 0) {
         fprintf(stderr, "Failed to create pulser thread.\n");
         goto cleanup;
     }
@@ -1460,7 +1489,7 @@ int main(int argc, char **argv)
         }
         invalid_axes_logged = 0;
 
-        if (last_x >= 0 && last_y >= 0 && two_finger_ok && !click_button_down) {
+        if (last_x >= 0 && last_y >= 0 && two_finger_ok) {
             double nx = (double)(last_x - min_x) / (double)(max_x - min_x);
             double ny = (double)(last_y - min_y) / (double)(max_y - min_y);
 
@@ -1469,16 +1498,28 @@ int main(int argc, char **argv)
             if (button_zone_exit_ny < 0.0)
                 button_zone_exit_ny = 0.0;
 
-            if (ny >= button_zone_enter_ny) {
-                button_zone_latched = 1;
-                edge_suppress_until_ms = now_ms_for_suppression + button_cooldown_ms;
-            } else if (button_zone_latched && ny < button_zone_exit_ny) {
+            if (button_zone_enabled) {
+                if (ny >= button_zone_enter_ny) {
+                    button_zone_latched = 1;
+                    edge_suppress_until_ms = now_ms_for_suppression + button_cooldown_ms;
+                } else if (button_zone_latched && ny < button_zone_exit_ny) {
+                    button_zone_latched = 0;
+                }
+            } else {
                 button_zone_latched = 0;
             }
 
-            if (button_zone_latched || in_button_cooldown) {
+            int suppressed = button_zone_latched || in_button_cooldown || click_button_down;
+            if (suppressed) {
                 nx = 0.5;
                 ny = 0.5;
+                if (verbose && (button_zone_latched || in_button_cooldown))
+                    fprintf(stderr,
+                            "[edge-motion] button-zone suppressed (latched=%d, cooldown=%d, click=%d, ny=%.3f)\n",
+                            button_zone_latched,
+                            in_button_cooldown,
+                            click_button_down,
+                            ny);
             }
             if (nx > 0.5 - deadzone && nx < 0.5 + deadzone)
                 nx = 0.5;
@@ -1573,7 +1614,6 @@ int main(int argc, char **argv)
             was_in_edge = 0;
             was_in_edge_x = 0;
             was_in_edge_y = 0;
-            button_zone_latched = 0;
         }
 
         pthread_mutex_lock(&state.lock);
@@ -1668,7 +1708,6 @@ int main(int argc, char **argv)
                                (ev.code == BTN_LEFT || ev.code == BTN_RIGHT || ev.code == BTN_MIDDLE)) {
                         if (ev.value > 0) {
                             click_button_down = 1;
-                            button_zone_latched = 0;
                         } else {
                             click_button_down = 0;
                         }
@@ -1684,6 +1723,8 @@ int main(int argc, char **argv)
                         was_in_edge_x = 0;
                         was_in_edge_y = 0;
                         button_zone_latched = 0;
+                        edge_suppress_until_ms = 0;
+                        click_button_down = 0;
                         preferred_slot = -1;
                         active_fingers = 0;
                         for (int i = 0; i < slot_count; i++) {
@@ -1735,6 +1776,7 @@ int main(int argc, char **argv)
                 active_fingers = 0;
                 click_button_down = 0;
                 button_zone_latched = 0;
+                edge_suppress_until_ms = 0;
                 cleanup_touchpad_resources(&tp);
                 pfd.fd = -1;
                 struct timespec now;
@@ -1747,6 +1789,7 @@ int main(int argc, char **argv)
             int64_t now_ms = monotonic_now_ms();
             if (now_ms >= next_reopen_at_ms) {
                 if (reopen_touchpad(&tp, &min_x, &max_x, &min_y, &max_y) == 0) {
+                    read_flags = LIBEVDEV_READ_FLAG_NORMAL;
                     read_pressure_range(tp.dev, &pressure_min, &pressure_max);
 
                     if (reset_multitouch_state(tp.dev, &slot_x, &slot_y, &slot_active, &slot_count) < 0) {
@@ -1768,6 +1811,7 @@ int main(int argc, char **argv)
                     active_fingers = 0;
                     click_button_down = 0;
                     button_zone_latched = 0;
+                    edge_suppress_until_ms = 0;
                     last_pressure = -1;
                     last_x = -1;
                     last_y = -1;
@@ -1793,9 +1837,10 @@ cleanup:
     if (thread_started)
         pthread_join(thr, NULL);
 
-    if (!thread_started && ufd >= 0) {
-        ioctl(ufd, UI_DEV_DESTROY);
-        close(ufd);
+    if (!thread_started && uinput_fd >= 0) {
+        ioctl(uinput_fd, UI_DEV_DESTROY);
+        close(uinput_fd);
+        uinput_fd = -1;
     }
 
     cleanup_touchpad_resources(&tp);
