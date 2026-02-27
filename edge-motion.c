@@ -21,7 +21,7 @@
 #include <libudev.h>
 #include <unistd.h>
 
-#define EDGE_MOTION_VERSION "1.3.0"
+#define EDGE_MOTION_VERSION "1.3.1"
 
 #define DEFAULT_EDGE_THRESHOLD 0.06
 #define DEFAULT_EDGE_HYSTERESIS 0.015
@@ -530,6 +530,24 @@ static inline int64_t monotonic_now_ms(void)
     return timespec_to_ms(&now);
 }
 
+static int is_touch_tool_key(int code)
+{
+    return code == BTN_TOOL_FINGER || code == BTN_TOOL_DOUBLETAP ||
+           code == BTN_TOOL_TRIPLETAP || code == BTN_TOOL_QUADTAP ||
+           code == BTN_TOOL_QUINTTAP;
+}
+
+static int has_touch_contact_signal(struct libevdev *dev)
+{
+    return libevdev_has_event_code(dev, EV_ABS, ABS_MT_TRACKING_ID) ||
+           libevdev_has_event_code(dev, EV_KEY, BTN_TOUCH) ||
+           libevdev_has_event_code(dev, EV_KEY, BTN_TOOL_FINGER) ||
+           libevdev_has_event_code(dev, EV_KEY, BTN_TOOL_DOUBLETAP) ||
+           libevdev_has_event_code(dev, EV_KEY, BTN_TOOL_TRIPLETAP) ||
+           libevdev_has_event_code(dev, EV_KEY, BTN_TOOL_QUADTAP) ||
+           libevdev_has_event_code(dev, EV_KEY, BTN_TOOL_QUINTTAP);
+}
+
 static int reset_multitouch_state(struct libevdev *dev, int **slot_x, int **slot_y,
                                   unsigned char **slot_active, int *slot_count)
 {
@@ -667,7 +685,7 @@ static int enumerate_touchpad_candidates(struct touchpad_candidate **out_items, 
                         absy = libevdev_get_abs_info(evdev, ABS_Y);
 
                     if (absx && absy && absx->maximum >= absx->minimum &&
-                        absy->maximum >= absy->minimum) {
+                        absy->maximum >= absy->minimum && has_touch_contact_signal(evdev)) {
                         const char *device_name = libevdev_get_name(evdev) ? libevdev_get_name(evdev)
                                                                           : "unknown";
                         char *devnode_copy = strdup(devnode);
@@ -1360,6 +1378,17 @@ int main(int argc, char **argv)
     int last_pressure = -1;
     int invalid_axes_logged = 0;
     struct timespec edge_enter_time = {0};
+    int has_mt_tracking_id = libevdev_has_event_code(tp.dev, EV_ABS, ABS_MT_TRACKING_ID);
+    int has_btn_touch = libevdev_has_event_code(tp.dev, EV_KEY, BTN_TOUCH);
+    int has_touch_tool_keys =
+        libevdev_has_event_code(tp.dev, EV_KEY, BTN_TOOL_FINGER) ||
+        libevdev_has_event_code(tp.dev, EV_KEY, BTN_TOOL_DOUBLETAP) ||
+        libevdev_has_event_code(tp.dev, EV_KEY, BTN_TOOL_TRIPLETAP) ||
+        libevdev_has_event_code(tp.dev, EV_KEY, BTN_TOOL_QUADTAP) ||
+        libevdev_has_event_code(tp.dev, EV_KEY, BTN_TOOL_QUINTTAP);
+    int has_touch_contact_key = has_btn_touch || has_touch_tool_keys;
+    int touch_contact = 0;
+    int touchpad_buttons_down_mask = 0;
 
     read_pressure_range(tp.dev, &pressure_min, &pressure_max);
 
@@ -1382,6 +1411,14 @@ int main(int argc, char **argv)
         int64_t edge_diff_ms = 0;
 
         double speed_factor = 0.0;
+        int touch_contact_active = 0;
+        if (has_mt_tracking_id)
+            touch_contact_active = active_fingers > 0;
+        else if (has_touch_contact_key)
+            touch_contact_active = touch_contact;
+        else
+            touch_contact_active = (last_x >= 0 && last_y >= 0);
+
         int two_finger_ok = !(mode == EM_MODE_SCROLL && two_finger_scroll) || active_fingers >= 2;
         if (max_x <= min_x || max_y <= min_y) {
             if (verbose && !invalid_axes_logged) {
@@ -1401,7 +1438,8 @@ int main(int argc, char **argv)
         }
         invalid_axes_logged = 0;
 
-        if (last_x >= 0 && last_y >= 0 && two_finger_ok) {
+        if (last_x >= 0 && last_y >= 0 && touch_contact_active && touchpad_buttons_down_mask == 0 &&
+            two_finger_ok) {
             double nx = (double)(last_x - min_x) / (double)(max_x - min_x);
             double ny = (double)(last_y - min_y) / (double)(max_y - min_y);
             if (nx > 0.5 - deadzone && nx < 0.5 + deadzone)
@@ -1587,22 +1625,51 @@ int main(int argc, char **argv)
                                 preferred_slot = current_slot;
                             }
                         }
-                    } else if (ev.type == EV_KEY &&
-                               ((ev.code == BTN_TOUCH || ev.code == BTN_TOOL_FINGER ||
-                                 ev.code == BTN_TOOL_PEN || ev.code == BTN_TOOL_MOUSE) &&
-                                ev.value == 0)) {
-                        last_x = -1;
-                        last_y = -1;
-                        last_pressure = -1;
-                        was_in_edge = 0;
-                        was_in_edge_x = 0;
-                        was_in_edge_y = 0;
-                        preferred_slot = -1;
-                        active_fingers = 0;
-                        for (int i = 0; i < slot_count; i++) {
-                            slot_active[i] = 0;
-                            slot_x[i] = -1;
-                            slot_y[i] = -1;
+                    } else if (ev.type == EV_KEY) {
+                        if (ev.code == BTN_LEFT) {
+                            if (ev.value == 0)
+                                touchpad_buttons_down_mask &= ~1;
+                            else
+                                touchpad_buttons_down_mask |= 1;
+                        } else if (ev.code == BTN_RIGHT) {
+                            if (ev.value == 0)
+                                touchpad_buttons_down_mask &= ~2;
+                            else
+                                touchpad_buttons_down_mask |= 2;
+                        } else if (ev.code == BTN_MIDDLE) {
+                            if (ev.value == 0)
+                                touchpad_buttons_down_mask &= ~4;
+                            else
+                                touchpad_buttons_down_mask |= 4;
+                        }
+
+                        int touch_released = 0;
+                        if (has_btn_touch && ev.code == BTN_TOUCH) {
+                            touch_contact = ev.value > 0 ? 1 : 0;
+                            touch_released = ev.value == 0;
+                        } else if (has_touch_tool_keys && is_touch_tool_key(ev.code)) {
+                            if (!has_btn_touch) {
+                                touch_contact = ev.value > 0 ? 1 : 0;
+                                touch_released = ev.value == 0;
+                            }
+                        }
+
+                        if (touch_released) {
+                            last_x = -1;
+                            last_y = -1;
+                            last_pressure = -1;
+                            was_in_edge = 0;
+                            was_in_edge_x = 0;
+                            was_in_edge_y = 0;
+                            preferred_slot = -1;
+                            if (!has_mt_tracking_id) {
+                                active_fingers = 0;
+                                for (int i = 0; i < slot_count; i++) {
+                                    slot_active[i] = 0;
+                                    slot_x[i] = -1;
+                                    slot_y[i] = -1;
+                                }
+                            }
                         }
                     }
                 }
@@ -1628,7 +1695,7 @@ int main(int argc, char **argv)
                 if (active_slot >= 0) {
                     last_x = slot_x[active_slot];
                     last_y = slot_y[active_slot];
-                } else {
+                } else if (has_mt_tracking_id) {
                     last_x = -1;
                     last_y = -1;
                 }
@@ -1646,6 +1713,8 @@ int main(int argc, char **argv)
                 was_in_edge_y = 0;
                 touchpad_available = 0;
                 active_fingers = 0;
+                touch_contact = 0;
+                touchpad_buttons_down_mask = 0;
                 cleanup_touchpad_resources(&tp);
                 pfd.fd = -1;
                 struct timespec now;
@@ -1659,6 +1728,15 @@ int main(int argc, char **argv)
             if (now_ms >= next_reopen_at_ms) {
                 if (reopen_touchpad(&tp, &min_x, &max_x, &min_y, &max_y) == 0) {
                     read_pressure_range(tp.dev, &pressure_min, &pressure_max);
+                    has_mt_tracking_id = libevdev_has_event_code(tp.dev, EV_ABS, ABS_MT_TRACKING_ID);
+                    has_btn_touch = libevdev_has_event_code(tp.dev, EV_KEY, BTN_TOUCH);
+                    has_touch_tool_keys =
+                        libevdev_has_event_code(tp.dev, EV_KEY, BTN_TOOL_FINGER) ||
+                        libevdev_has_event_code(tp.dev, EV_KEY, BTN_TOOL_DOUBLETAP) ||
+                        libevdev_has_event_code(tp.dev, EV_KEY, BTN_TOOL_TRIPLETAP) ||
+                        libevdev_has_event_code(tp.dev, EV_KEY, BTN_TOOL_QUADTAP) ||
+                        libevdev_has_event_code(tp.dev, EV_KEY, BTN_TOOL_QUINTTAP);
+                    has_touch_contact_key = has_btn_touch || has_touch_tool_keys;
 
                     if (reset_multitouch_state(tp.dev, &slot_x, &slot_y, &slot_active, &slot_count) < 0) {
                         fprintf(stderr, "Failed to refresh multitouch state after reconnect.\n");
@@ -1677,6 +1755,8 @@ int main(int argc, char **argv)
                     current_slot = 0;
                     preferred_slot = -1;
                     active_fingers = 0;
+                    touch_contact = 0;
+                    touchpad_buttons_down_mask = 0;
                     last_pressure = -1;
                     last_x = -1;
                     last_y = -1;
