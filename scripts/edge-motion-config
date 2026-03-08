@@ -248,25 +248,14 @@ zenity_pick_mode_and_toggles() {
 }
 
 zenity_numeric_form() {
-  local out
+  local out th hm pm ps ms ac dz
   out=$(zenity --forms --title="$(txt 'edge-motion: ввод чисел' 'edge-motion: numeric input')" --width=560 \
     --text="$(txt 'Введите числовые параметры' 'Enter numeric parameters')" --separator='|' \
     --add-entry="threshold" --add-entry="hold-ms" --add-entry="pulse-ms" \
     --add-entry="pulse-step" --add-entry="max-speed" --add-entry="accel-exponent" \
     --add-entry="deadzone") || return 1
 
-  mode="$(find_opt --mode "${CURRENT_ARGS[@]}" || echo motion)"
-  threshold="$(find_opt --threshold "${CURRENT_ARGS[@]}" || echo 0.06)"
-  hold_ms="$(find_opt --hold-ms "${CURRENT_ARGS[@]}" || echo 90)"
-  pulse_ms="$(find_opt --pulse-ms "${CURRENT_ARGS[@]}" || echo 12)"
-  pulse_step="$(find_opt --pulse-step "${CURRENT_ARGS[@]}" || echo 1.5)"
-  max_speed="$(find_opt --max-speed "${CURRENT_ARGS[@]}" || echo 2.4)"
-  accel="$(find_opt --accel-exponent "${CURRENT_ARGS[@]}" || echo 1.6)"
-  deadzone="$(find_opt --deadzone "${CURRENT_ARGS[@]}" || echo 0.07)"
-  natural="$(find_opt --natural-scroll "${CURRENT_ARGS[@]}" || echo 0)"
-  diagonal="$(find_opt --diagonal-scroll "${CURRENT_ARGS[@]}" || echo 0)"
-  twofinger="$(find_opt --two-finger-scroll "${CURRENT_ARGS[@]}" || echo 0)"
-  if find_opt --grab "${CURRENT_ARGS[@]}" >/dev/null; then grab=1; else grab=0; fi
+  IFS='|' read -r th hm pm ps ms ac dz <<<"$out"
 
   if ! validate_ranges "$mode" "$th" "$hm" "$pm" "$ps" "$ms" "$ac" "$dz"; then
     msg "$(txt 'Часть значений вне допустимого диапазона.\nthreshold/deadzone: 0..0.49, hold-ms: 0..5000, pulse-ms: 1..500, pulse-step: >0..10, max-speed: >0..20, accel: 1..6' 'Some values are out of range.\nthreshold/deadzone: 0..0.49, hold-ms: 0..5000, pulse-ms: 1..500, pulse-step: >0..10, max-speed: >0..20, accel: 1..6')"
