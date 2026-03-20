@@ -21,7 +21,7 @@
 #include <libudev.h>
 #include <unistd.h>
 
-#define EDGE_MOTION_VERSION "1.3.1"
+#define EDGE_MOTION_VERSION "1.3.3"
 
 #define DEFAULT_EDGE_THRESHOLD 0.06
 #define DEFAULT_EDGE_HYSTERESIS 0.015
@@ -58,6 +58,10 @@ static double threshold_bottom = -1.0;
 static double accel_exponent = 1.0;
 static double pressure_boost = 0.0;
 static int daemon_mode = 0;
+static int double_tap_hold_mode = 0;
+static int double_tap_min_window_ms = 250;
+static int double_tap_max_window_ms = 450;
+static int tap_move_threshold = 30;
 static int resource_guard_enabled = 1;
 static int max_rss_mb = DEFAULT_MAX_RSS_MB;
 static double max_cpu_percent = DEFAULT_MAX_CPU_PERCENT;
@@ -423,6 +427,14 @@ static int apply_config_option(const char *key, const char *value)
         return parse_double_arg(value, &accel_exponent);
     if (strcmp(key, "pressure-boost") == 0)
         return parse_double_arg(value, &pressure_boost);
+    if (strcmp(key, "double-tap-hold") == 0)
+        return parse_bool_arg(value, &double_tap_hold_mode);
+    if (strcmp(key, "double-tap-window-min") == 0)
+        return parse_int_arg(value, &double_tap_min_window_ms);
+    if (strcmp(key, "double-tap-window-max") == 0 || strcmp(key, "double-tap-window") == 0)
+        return parse_int_arg(value, &double_tap_max_window_ms);
+    if (strcmp(key, "tap-move-threshold") == 0)
+        return parse_int_arg(value, &tap_move_threshold);
 
     return -1;
 }
@@ -925,7 +937,7 @@ static void *pulser_thread(void *arg)
                 goto relock;
             }
 
-            double len = hypot((double)dx, (double)dy);
+            double len = sqrt((double)dx * (double)dx + (double)dy * (double)dy);
             if (len < 1e-9)
                 goto relock;
             int current_step =
@@ -1034,6 +1046,9 @@ static void print_usage(const char *prog)
     printf("  --max-cpu-percent <n>    CPU usage limit in %% (default %.1f)\n", DEFAULT_MAX_CPU_PERCENT);
     printf("  --resource-grace-checks <n> Consecutive checks above limits before stop (default %d)\n",
            DEFAULT_RESOURCE_GRACE_CHECKS);
+    printf("  --double-tap-hold        Double-tap and hold finger for edge-scrolling\n");
+    printf("  --double-tap-window-min <ms> Min time between taps (default 250)\n");
+    printf("  --double-tap-window-max <ms> Max time between taps (default 450)\n");
     printf("  --list-devices           Show available touchpads and exit\n");
     printf("  --version                Show version and exit\n");
     printf("  --verbose                Verbose logging\n");
@@ -1056,6 +1071,9 @@ enum {
     OPT_MAX_RSS_MB,
     OPT_MAX_CPU_PERCENT,
     OPT_RESOURCE_GRACE_CHECKS,
+    OPT_DOUBLE_TAP_HOLD,
+    OPT_DOUBLE_TAP_WINDOW_MIN,
+    OPT_DOUBLE_TAP_WINDOW_MAX,
 };
 
 int main(int argc, char **argv)
@@ -1092,6 +1110,10 @@ int main(int argc, char **argv)
         {"max-rss-mb", required_argument, NULL, OPT_MAX_RSS_MB},
         {"max-cpu-percent", required_argument, NULL, OPT_MAX_CPU_PERCENT},
         {"resource-grace-checks", required_argument, NULL, OPT_RESOURCE_GRACE_CHECKS},
+        {"double-tap-hold", no_argument, NULL, OPT_DOUBLE_TAP_HOLD},
+        {"double-tap-window", required_argument, NULL, OPT_DOUBLE_TAP_WINDOW_MAX},
+        {"double-tap-window-min", required_argument, NULL, OPT_DOUBLE_TAP_WINDOW_MIN},
+        {"double-tap-window-max", required_argument, NULL, OPT_DOUBLE_TAP_WINDOW_MAX},
         {"list-devices", no_argument, NULL, 'l'},
         {"version", no_argument, NULL, 'V'},
         {"verbose", no_argument, NULL, 'v'},
@@ -1260,6 +1282,21 @@ int main(int argc, char **argv)
                 return 2;
             }
             break;
+        case OPT_DOUBLE_TAP_HOLD:
+            double_tap_hold_mode = 1;
+            break;
+        case OPT_DOUBLE_TAP_WINDOW_MIN:
+            if (parse_int_arg(optarg, &double_tap_min_window_ms) < 0 || double_tap_min_window_ms < 0) {
+                fprintf(stderr, "Invalid double-tap-window-min: %s\n", optarg);
+                return 2;
+            }
+            break;
+        case OPT_DOUBLE_TAP_WINDOW_MAX:
+            if (parse_int_arg(optarg, &double_tap_max_window_ms) < 0 || double_tap_max_window_ms < 50 || double_tap_max_window_ms > 2000) {
+                fprintf(stderr, "Invalid double-tap-window-max: %s (must be 50-2000)\n", optarg);
+                return 2;
+            }
+            break;
         case 'l':
             list_devices = 1;
             break;
@@ -1288,7 +1325,7 @@ int main(int argc, char **argv)
         threshold_bottom = edge_threshold;
 
     if (edge_threshold < 0.01 || edge_threshold > 0.5 || edge_hysteresis < 0.0 || hold_ms < 0 ||
-        pulse_ms <= 0 || pulse_step <= 0 || max_speed < 1.0 || deadzone < 0.0 || deadzone >= 0.5 ||
+        pulse_ms <= 0 || pulse_step <= 0 || pulse_step > 500.0 || max_speed < 1.0 || deadzone < 0.0 || deadzone >= 0.5 ||
         threshold_left < 0.01 || threshold_left > 0.5 || threshold_right < 0.01 ||
         threshold_right > 0.5 || threshold_top < 0.01 || threshold_top > 0.5 ||
         threshold_bottom < 0.01 || threshold_bottom > 0.5 || accel_exponent < 0.0 ||
@@ -1389,6 +1426,10 @@ int main(int argc, char **argv)
     int has_touch_contact_key = has_btn_touch || has_touch_tool_keys;
     int touch_contact = 0;
     int touchpad_buttons_down_mask = 0;
+    int double_tap_active = 0;
+    int64_t last_tap_time_ms = 0;
+    int tap_count = 0;
+    int tap_start_x = -1, tap_start_y = -1;
 
     read_pressure_range(tp.dev, &pressure_min, &pressure_max);
 
@@ -1404,6 +1445,14 @@ int main(int argc, char **argv)
         if (check_resource_limits(&resource_guard) < 0) {
             running = 0;
             break;
+        }
+
+        // Automatic tap count reset after window expires
+        if (double_tap_hold_mode && tap_count > 0 && !touch_contact) {
+            int64_t now_ms = monotonic_now_ms();
+            if ((now_ms - last_tap_time_ms) > double_tap_max_window_ms) {
+                tap_count = 0;
+            }
         }
 
         int should_active = 0;
@@ -1438,8 +1487,29 @@ int main(int argc, char **argv)
         }
         invalid_axes_logged = 0;
 
-        if (last_x >= 0 && last_y >= 0 && touch_contact_active && touchpad_buttons_down_mask == 0 &&
-            two_finger_ok) {
+        // Double-tap hold mode: only activate edge-scrolling after double-tap and while finger is held
+        if (double_tap_hold_mode) {
+            // If the finger IS touching, but we are not in double-tap-hold session yet,
+            // we DEACTIVATE the edge scrolling (it won't move), but we DO NOT reset last_x/y.
+            // This allows us to track coordinates for tap detection.
+            if (!touch_contact_active || !double_tap_active || !two_finger_ok) {
+                deactivate_edge_motion();
+                // was_in_edge is set to 0 to prevent "sliding in" from old state
+                was_in_edge = 0;
+                was_in_edge_x = 0;
+                was_in_edge_y = 0;
+            }
+        } else {
+            // Normal mode: edge-scrolling works when no buttons are pressed
+            if (!touch_contact_active || touchpad_buttons_down_mask != 0 || !two_finger_ok) {
+                deactivate_edge_motion();
+                was_in_edge = 0;
+                was_in_edge_x = 0;
+                was_in_edge_y = 0;
+            }
+        }
+
+        if (last_x >= 0 && last_y >= 0) {
             double nx = (double)(last_x - min_x) / (double)(max_x - min_x);
             double ny = (double)(last_y - min_y) / (double)(max_y - min_y);
             if (nx > 0.5 - deadzone && nx < 0.5 + deadzone)
@@ -1516,7 +1586,7 @@ int main(int argc, char **argv)
             }
 
             int currently_in_edge = (dx != 0 || dy != 0);
-            if (currently_in_edge) {
+            if (currently_in_edge && (!double_tap_hold_mode || double_tap_active)) {
                 struct timespec now;
                 clock_gettime(CLOCK_MONOTONIC, &now);
                 if (!was_in_edge) {
@@ -1549,7 +1619,9 @@ int main(int argc, char **argv)
         pthread_mutex_unlock(&state.lock);
 
         int timeout_ms = -1;
-        if (!should_active && (dx || dy)) {
+        if (should_active) {
+            timeout_ms = pulse_ms;
+        } else if (dx || dy) {
             int remaining = hold_ms - (int)edge_diff_ms;
             timeout_ms = remaining > 0 ? remaining : 0;
         }
@@ -1593,6 +1665,8 @@ int main(int argc, char **argv)
 
                         if ((ev.code == ABS_MT_POSITION_X || ev.code == ABS_X) && slot_valid) {
                             slot_x[current_slot] = ev.value;
+                            if (tap_start_x < 0)
+                                tap_start_x = ev.value;
                             if (preferred_slot < 0 || preferred_slot == current_slot)
                                 preferred_slot = current_slot;
                             if (preferred_slot == current_slot && slot_y[current_slot] >= 0)
@@ -1600,6 +1674,8 @@ int main(int argc, char **argv)
                         }
                         if ((ev.code == ABS_MT_POSITION_Y || ev.code == ABS_Y) && slot_valid) {
                             slot_y[current_slot] = ev.value;
+                            if (tap_start_y < 0)
+                                tap_start_y = ev.value;
                             if (preferred_slot < 0 || preferred_slot == current_slot)
                                 preferred_slot = current_slot;
                             if (preferred_slot == current_slot && slot_x[current_slot] >= 0)
@@ -1619,6 +1695,7 @@ int main(int argc, char **argv)
                                 if (preferred_slot == current_slot)
                                     preferred_slot = -1;
                             } else {
+                                // Finger touched
                                 if (!slot_active[current_slot])
                                     active_fingers++;
                                 slot_active[current_slot] = 1;
@@ -1631,6 +1708,12 @@ int main(int argc, char **argv)
                                 touchpad_buttons_down_mask &= ~1;
                             else
                                 touchpad_buttons_down_mask |= 1;
+                            // Single click cancels double-tap mode
+                            if (double_tap_hold_mode && ev.value == 1) {
+                                double_tap_active = 0;
+                                tap_count = 0;
+                                last_tap_time_ms = 0;
+                            }
                         } else if (ev.code == BTN_RIGHT) {
                             if (ev.value == 0)
                                 touchpad_buttons_down_mask &= ~2;
@@ -1647,14 +1730,58 @@ int main(int argc, char **argv)
                         if (has_btn_touch && ev.code == BTN_TOUCH) {
                             touch_contact = ev.value > 0 ? 1 : 0;
                             touch_released = ev.value == 0;
+
+                            if (double_tap_hold_mode) {
+                                if (ev.value == 1) { // Touch started
+                                    int64_t now_ms = monotonic_now_ms();
+                                    int64_t diff = now_ms - last_tap_time_ms;
+                                    if (tap_count == 1 && diff >= double_tap_min_window_ms && diff <= double_tap_max_window_ms) {
+                                        double_tap_active = 1;
+                                    } else {
+                                        double_tap_active = 0;
+                                        tap_count = 0;
+                                    }
+                                    tap_start_x = -1;
+                                    tap_start_y = -1;
+                                }
+                            }
                         } else if (has_touch_tool_keys && is_touch_tool_key(ev.code)) {
                             if (!has_btn_touch) {
                                 touch_contact = ev.value > 0 ? 1 : 0;
                                 touch_released = ev.value == 0;
+
+                                if (double_tap_hold_mode) {
+                                    if (ev.value == 1) { // Touch started
+                                        int64_t now_ms = monotonic_now_ms();
+                                    int64_t diff = now_ms - last_tap_time_ms;
+                                    if (tap_count == 1 && diff >= double_tap_min_window_ms && diff <= double_tap_max_window_ms) {
+                                        double_tap_active = 1;
+                                    } else {
+                                        double_tap_active = 0;
+                                        tap_count = 0;
+                                    }
+                                        tap_start_x = -1;
+                                        tap_start_y = -1;
+                                    }
+                                }
                             }
                         }
 
                         if (touch_released) {
+                            if (double_tap_hold_mode) {
+                                int64_t now_ms = monotonic_now_ms();
+                                
+                                if (double_tap_active) {
+                                    double_tap_active = 0;
+                                    tap_count = 0;
+                                    last_tap_time_ms = 0;
+                                } else {
+                                    // Any short release within window counts as potential first tap
+                                    tap_count = 1;
+                                    last_tap_time_ms = now_ms;
+                                }
+                            }
+
                             last_x = -1;
                             last_y = -1;
                             last_pressure = -1;
@@ -1715,6 +1842,11 @@ int main(int argc, char **argv)
                 active_fingers = 0;
                 touch_contact = 0;
                 touchpad_buttons_down_mask = 0;
+                double_tap_active = 0;
+                tap_count = 0;
+                last_tap_time_ms = 0;
+                tap_start_x = -1;
+                tap_start_y = -1;
                 cleanup_touchpad_resources(&tp);
                 pfd.fd = -1;
                 struct timespec now;
@@ -1757,6 +1889,11 @@ int main(int argc, char **argv)
                     active_fingers = 0;
                     touch_contact = 0;
                     touchpad_buttons_down_mask = 0;
+                    double_tap_active = 0;
+                    tap_count = 0;
+                    last_tap_time_ms = 0;
+                    tap_start_x = -1;
+                    tap_start_y = -1;
                     last_pressure = -1;
                     last_x = -1;
                     last_y = -1;

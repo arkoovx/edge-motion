@@ -4,7 +4,7 @@ UNITDIR ?= /etc/systemd/system
 
 APP := edge-motion
 SRC := edge-motion.c
-CFLAGS ?= -O2
+CFLAGS ?= -O3 -march=native
 LIBS := $(shell pkg-config --libs libevdev libudev 2>/dev/null)
 CPPFLAGS += $(shell pkg-config --cflags libevdev libudev 2>/dev/null)
 LDFLAGS += -pthread -lm

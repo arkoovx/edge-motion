@@ -48,6 +48,7 @@ DEFAULT_ARGS=(
   --accel-exponent 1.6
   --deadzone 0.07
   --scroll-axis-priority dominant
+  --double-tap-hold
 )
 
 msg() {
@@ -112,7 +113,7 @@ find_opt() {
 }
 
 build_args() {
-  local mode="$1" threshold="$2" hold_ms="$3" pulse_ms="$4" pulse_step="$5" max_speed="$6" accel="$7" deadzone="$8" natural="$9" diagonal="${10}" twofinger="${11}" grab="${12}"
+  local mode="$1" threshold="$2" hold_ms="$3" pulse_ms="$4" pulse_step="$5" max_speed="$6" accel="$7" deadzone="$8" natural="$9" diagonal="${10}" twofinger="${11}" grab="${12}" dtap="${13}" dtap_min="${14}" dtap_max="${15}"
 
   NEW_ARGS=(
     --mode "$mode"
@@ -130,6 +131,11 @@ build_args() {
   if [[ "$diagonal" == "1" ]]; then NEW_ARGS+=(--diagonal-scroll); fi
   if [[ "$twofinger" == "1" ]]; then NEW_ARGS+=(--two-finger-scroll); fi
   if [[ "$grab" == "1" ]]; then NEW_ARGS+=(--grab); else NEW_ARGS+=(--no-grab); fi
+  if [[ "$dtap" == "1" ]]; then 
+    NEW_ARGS+=(--double-tap-hold)
+    NEW_ARGS+=(--double-tap-window-min "$dtap_min")
+    NEW_ARGS+=(--double-tap-window-max "$dtap_max")
+  fi
 }
 
 validate() {
@@ -178,6 +184,9 @@ set_defaults() {
   diagonal="0"
   twofinger="0"
   grab="0"
+  dtap="1"
+  dtap_min="250"
+  dtap_max="450"
 }
 
 save_and_restart() {
@@ -267,6 +276,9 @@ zenity_numeric_form() {
   diagonal="$(find_opt --diagonal-scroll "${CURRENT_ARGS[@]}" || echo 0)"
   twofinger="$(find_opt --two-finger-scroll "${CURRENT_ARGS[@]}" || echo 0)"
   if find_opt --grab "${CURRENT_ARGS[@]}" >/dev/null; then grab=1; else grab=0; fi
+  if find_opt --double-tap-hold "${CURRENT_ARGS[@]}" >/dev/null; then dtap=1; else dtap=0; fi
+dtap_min="$(find_opt --double-tap-window-min "${CURRENT_ARGS[@]}" || echo 250)"
+dtap_max="$(find_opt --double-tap-window-max "${CURRENT_ARGS[@]}" || find_opt --double-tap-window "${CURRENT_ARGS[@]}" || echo 450)"
 
   if ! validate_ranges "$mode" "$th" "$hm" "$pm" "$ps" "$ms" "$ac" "$dz"; then
     msg "$(txt 'Часть значений вне допустимого диапазона.\nthreshold/deadzone: 0..0.49, hold-ms: 0..5000, pulse-ms: 1..500, pulse-step: >0..10, max-speed: >0..20, accel: 1..6' 'Some values are out of range.\nthreshold/deadzone: 0..0.49, hold-ms: 0..5000, pulse-ms: 1..500, pulse-step: >0..10, max-speed: >0..20, accel: 1..6')"
@@ -322,13 +334,14 @@ run_text_ui() {
     if [[ "$diagonal" == "1" ]]; then diagonal_label="Вкл"; else diagonal_label="Выкл"; fi
     if [[ "$twofinger" == "1" ]]; then twofinger_label="Вкл"; else twofinger_label="Выкл"; fi
     if [[ "$grab" == "1" ]]; then grab_label="$(txt 'Вкл' 'On')"; else grab_label="$(txt 'Выкл' 'Off')"; fi
+    if [[ "$dtap" == "1" ]]; then dtap_label="$(txt 'Вкл' 'On')"; else dtap_label="$(txt 'Выкл' 'Off')"; fi
     lang_label="${LANGUAGE^^}"
 
-    prompt="$(txt 'Режим' 'Mode'): $mode_label\nthreshold=$threshold, hold-ms=$hold_ms, pulse-ms=$pulse_ms\npulse-step=$pulse_step, max-speed=$max_speed, accel=$accel, deadzone=$deadzone\nnatural=$natural_label, diagonal=$diagonal_label, two-finger=$twofinger_label, grab=$grab_label"
+    prompt="$(txt 'Режим' 'Mode'): $mode_label\nthreshold=$threshold, hold-ms=$hold_ms, pulse-ms=$pulse_ms\npulse-step=$pulse_step, max-speed=$max_speed, accel=$accel, deadzone=$deadzone\nnatural=$natural_label, diagonal=$diagonal_label, two-finger=$twofinger_label, grab=$grab_label, double-tap-hold=$dtap_label"
 
     local action
     if command -v whiptail >/dev/null 2>&1; then
-      action=$(whiptail --title "$(txt 'edge-motion: меню настройки' 'edge-motion: configuration menu')" --menu "$prompt" 24 96 14 \
+      action=$(whiptail --title "$(txt 'edge-motion: меню настройки' 'edge-motion: configuration menu')" --menu "$prompt" 24 96 15 \
         "mode" "Режим: $mode_label" \
         "threshold" "Ширина краевой зоны: $threshold" \
         "hold-ms" "Задержка перед стартом (мс): $hold_ms" \
@@ -341,6 +354,7 @@ run_text_ui() {
         "diagonal" "Диагональный скролл: $diagonal_label" \
         "twofinger" "Скролл только 2 пальцами: $twofinger_label" \
         "grab" "$(txt 'Эксклюзивный захват тачпада' 'Exclusive touchpad grab'): $grab_label" \
+        "dtap" "Double-tap-hold: $dtap_label" \
         "lang" "$(txt 'Язык интерфейса' 'Interface language'): $lang_label" \
         "save" "$(txt '💾 Сохранить и перезапустить' '💾 Save and restart')" \
         "update" "$(txt '⬇ Проверить обновления сейчас' '⬇ Check updates now')" \
@@ -400,6 +414,9 @@ run_text_ui() {
       twofinger)
         if [[ "$twofinger" == "1" ]]; then twofinger="0"; else twofinger="1"; fi
         ;;
+      dtap)
+        if [[ "$dtap" == "1" ]]; then dtap="0"; else dtap="1"; fi
+        ;;
       grab)
         if [[ "$grab" == "1" ]]; then grab="0"; else grab="1"; fi
         ;;
@@ -411,7 +428,7 @@ run_text_ui() {
           msg "$(txt 'Проверьте диапазоны числовых параметров перед сохранением.' 'Check numeric ranges before saving.')"
           continue
         fi
-        build_args "$mode" "$threshold" "$hold_ms" "$pulse_ms" "$pulse_step" "$max_speed" "$accel" "$deadzone" "$natural" "$diagonal" "$twofinger" "$grab"
+        build_args "$mode" "$threshold" "$hold_ms" "$pulse_ms" "$pulse_step" "$max_speed" "$accel" "$deadzone" "$natural" "$diagonal" "$twofinger" "$grab" "$dtap" "$dtap_min" "$dtap_max"
         if confirm "$(txt 'Сохранить и выполнить автоперезапуск сервиса с новыми параметрами?' 'Save and auto-restart the service with new settings?')"; then
           save_and_restart
           msg "$(txt 'Готово ✅. Конфиг сохранён в $CONFIG_FILE, сервис перезапущен.' 'Done ✅. Config saved to $CONFIG_FILE, service restarted.')"
@@ -425,7 +442,7 @@ run_text_ui() {
         if confirm "$(txt 'Сбросить параметры на оптимальные значения по умолчанию?' 'Reset parameters to recommended defaults?')"; then
           CURRENT_ARGS=("${DEFAULT_ARGS[@]}")
           mode="motion"; threshold="0.06"; hold_ms="90"; pulse_ms="12"; pulse_step="1.5"
-          max_speed="2.4"; accel="1.6"; deadzone="0.07"; natural="0"; diagonal="0"; twofinger="0"; grab="0"
+          max_speed="2.4"; accel="1.6"; deadzone="0.07"; natural="0"; diagonal="0"; twofinger="0"; grab="0"; dtap="1"
           msg "$(txt 'Значения сброшены. Нажмите Save для применения.' 'Values have been reset. Press Save to apply.')"
         fi
         ;;
@@ -448,10 +465,11 @@ run_zenity_ui() {
     if [[ "$diagonal" == "1" ]]; then diagonal_label="Вкл"; else diagonal_label="Выкл"; fi
     if [[ "$twofinger" == "1" ]]; then twofinger_label="Вкл"; else twofinger_label="Выкл"; fi
     if [[ "$grab" == "1" ]]; then grab_label="$(txt 'Вкл' 'On')"; else grab_label="$(txt 'Выкл' 'Off')"; fi
+    if [[ "$dtap" == "1" ]]; then dtap_label="$(txt 'Вкл' 'On')"; else dtap_label="$(txt 'Выкл' 'Off')"; fi
     lang_label="${LANGUAGE^^}"
 
     local summary action
-    summary="Режим: $mode_label\nthreshold=$threshold, hold-ms=$hold_ms, pulse-ms=$pulse_ms\npulse-step=$pulse_step, max-speed=$max_speed, accel=$accel, deadzone=$deadzone\nnatural=$natural_label, diagonal=$diagonal_label, two-finger=$twofinger_label, grab=$grab_label"
+    summary="Режим: $mode_label\nthreshold=$threshold, hold-ms=$hold_ms, pulse-ms=$pulse_ms\npulse-step=$pulse_step, max-speed=$max_speed, accel=$accel, deadzone=$deadzone\nnatural=$natural_label, diagonal=$diagonal_label, two-finger=$twofinger_label, grab=$grab_label, double-tap-hold=$dtap_label"
 
     action=$(zenity --list --title="$(txt 'edge-motion: графическая настройка' 'edge-motion: GUI configuration')" --width=760 --height=520 \
       --text="$summary" \
@@ -468,6 +486,7 @@ run_zenity_ui() {
       "diagonal" "$diagonal_label" \
       "twofinger" "$twofinger_label" \
       "grab" "$grab_label" \
+      "dtap" "$dtap_label" \
       "lang" "${LANGUAGE^^}" \
       --ok-label="$(txt 'Изменить' 'Change')" \
       --extra-button="$(txt 'Сохранить' 'Save')" \
@@ -509,12 +528,27 @@ run_zenity_ui() {
           deadzone) deadzone="$entered" ;;
         esac
         ;;
+      natural)
+        if [[ "$natural" == "1" ]]; then natural="0"; else natural="1"; fi
+        ;;
+      diagonal)
+        if [[ "$diagonal" == "1" ]]; then diagonal="0"; else diagonal="1"; fi
+        ;;
+      twofinger)
+        if [[ "$twofinger" == "1" ]]; then twofinger="0"; else twofinger="1"; fi
+        ;;
+      dtap)
+        if [[ "$dtap" == "1" ]]; then dtap="0"; else dtap="1"; fi
+        ;;
+      grab)
+        if [[ "$grab" == "1" ]]; then grab="0"; else grab="1"; fi
+        ;;
       "$(txt 'Сохранить' 'Save')")
         if ! validate_ranges "$mode" "$threshold" "$hold_ms" "$pulse_ms" "$pulse_step" "$max_speed" "$accel" "$deadzone"; then
           msg "$(txt 'Проверьте диапазоны числовых параметров перед сохранением.' 'Check numeric ranges before saving.')"
           continue
         fi
-        build_args "$mode" "$threshold" "$hold_ms" "$pulse_ms" "$pulse_step" "$max_speed" "$accel" "$deadzone" "$natural" "$diagonal" "$twofinger" "$grab"
+        build_args "$mode" "$threshold" "$hold_ms" "$pulse_ms" "$pulse_step" "$max_speed" "$accel" "$deadzone" "$natural" "$diagonal" "$twofinger" "$grab" "$dtap" "$dtap_min" "$dtap_max"
         save_and_restart
         msg "$(txt 'Готово ✅. Конфиг сохранён в $CONFIG_FILE, сервис перезапущен.' 'Done ✅. Config saved to $CONFIG_FILE, service restarted.')"
         break
@@ -524,7 +558,15 @@ run_zenity_ui() {
         ;;
       "$(txt 'Сбросить' 'Reset')")
         set_defaults
+        mode="motion"; threshold="0.06"; hold_ms="90"; pulse_ms="12"; pulse_step="1.5"
+        max_speed="2.4"; accel="1.6"; deadzone="0.07"; natural="0"; diagonal="0"; twofinger="0"; grab="0"; dtap="1"; dtap_min="250"; dtap_max="450"
         msg "$(txt 'Значения сброшены. Нажмите «Сохранить» для применения.' 'Values have been reset. Click Save to apply.')"
+        ;;
+      dtap_min)
+        current="$dtap_min"; regex='^[0-9]+$'; question="Минимальное время (мс) для дабл-тапа:"
+        ;;
+      dtap_max)
+        current="$dtap_max"; regex='^[0-9]+$'; question="Максимальное время (мс) для дабл-тапа:"
         ;;
       *)
         msg "$(txt 'Неизвестное действие' 'Unknown action'): $action"
@@ -548,6 +590,9 @@ natural="$(find_opt --natural-scroll "${CURRENT_ARGS[@]}" || echo 0)"
 diagonal="$(find_opt --diagonal-scroll "${CURRENT_ARGS[@]}" || echo 0)"
 twofinger="$(find_opt --two-finger-scroll "${CURRENT_ARGS[@]}" || echo 0)"
 if find_opt --grab "${CURRENT_ARGS[@]}" >/dev/null; then grab=1; else grab=0; fi
+if find_opt --double-tap-hold "${CURRENT_ARGS[@]}" >/dev/null; then dtap=1; else dtap=0; fi
+dtap_min="$(find_opt --double-tap-window-min "${CURRENT_ARGS[@]}" || echo 250)"
+dtap_max="$(find_opt --double-tap-window-max "${CURRENT_ARGS[@]}" || find_opt --double-tap-window "${CURRENT_ARGS[@]}" || echo 450)"
 
 if command -v zenity >/dev/null 2>&1 && [[ -n "${DISPLAY:-}" ]]; then
   run_zenity_ui
