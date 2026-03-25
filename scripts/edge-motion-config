@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# edge-motion-config: GUI/TUI utility to configure edge-motion daemon.
+# Updated for v1.3.3+ with double-tap support.
+
 CONFIG_FILE="${EDGE_MOTION_CONFIG_FILE:-/etc/default/edge-motion}"
 SERVICE_NAME="${EDGE_MOTION_SERVICE_NAME:-edge-motion.service}"
 LANGUAGE="${EDGE_MOTION_LANG:-${LANG:-ru}}"
@@ -112,8 +115,6 @@ find_opt() {
 }
 
 build_args() {
-  local mode="$1" threshold="$2" hold_ms="$3" pulse_ms="$4" pulse_step="$5" max_speed="$6" accel="$7" deadzone="$8" natural="$9" diagonal="${10}" twofinger="${11}" grab="${12}"
-
   NEW_ARGS=(
     --mode "$mode"
     --threshold "$threshold"
@@ -130,17 +131,16 @@ build_args() {
   if [[ "$diagonal" == "1" ]]; then NEW_ARGS+=(--diagonal-scroll); fi
   if [[ "$twofinger" == "1" ]]; then NEW_ARGS+=(--two-finger-scroll); fi
   if [[ "$grab" == "1" ]]; then NEW_ARGS+=(--grab); else NEW_ARGS+=(--no-grab); fi
-}
-
-validate() {
-  local regex="$1" value="$2"
-  [[ "$value" =~ $regex ]]
+  
+  if [[ "$dt_hold" == "1" ]]; then 
+    NEW_ARGS+=(--double-tap-hold --double-tap-window-min "$dt_min" --double-tap-window-max "$dt_max")
+  fi
 }
 
 validate_ranges() {
-  local mode_v="$1" threshold_v="$2" hold_v="$3" pulse_v="$4" step_v="$5" max_v="$6" accel_v="$7" deadzone_v="$8"
+  local mode_v="$1" threshold_v="$2" hold_v="$3" pulse_v="$4" step_v="$5" max_v="$6" accel_v="$7" deadzone_v="$8" dt_min_v="$9" dt_max_v="${10}"
 
-  awk -v mode="$mode_v" -v t="$threshold_v" -v h="$hold_v" -v p="$pulse_v" -v s="$step_v" -v m="$max_v" -v a="$accel_v" -v d="$deadzone_v" '
+  awk -v mode="$mode_v" -v t="$threshold_v" -v h="$hold_v" -v p="$pulse_v" -v s="$step_v" -v m="$max_v" -v a="$accel_v" -v d="$deadzone_v" -v dtmin="$dt_min_v" -v dtmax="$dt_max_v" '
     BEGIN {
       if (mode != "motion" && mode != "scroll") exit 10;
       if (!(t >= 0 && t <= 0.49)) exit 11;
@@ -150,34 +150,17 @@ validate_ranges() {
       if (!(m > 0 && m <= 20)) exit 15;
       if (!(a >= 1 && a <= 6)) exit 16;
       if (!(d >= 0 && d <= 0.49)) exit 17;
+      if (!(dtmin >= 0 && dtmin <= 1000)) exit 18;
+      if (!(dtmax >= 50 && dtmax <= 2000)) exit 19;
       exit 0;
     }
   '
 }
 
-to_scaled_int() {
-  local value="$1" scale="$2"
-  awk -v v="$value" -v s="$scale" 'BEGIN { printf "%d", (v * s + 0.5) }'
-}
-
-from_scaled_int() {
-  local value="$1" scale="$2" precision="$3"
-  awk -v v="$value" -v s="$scale" -v p="$precision" 'BEGIN { printf "%.*f", p, (v / s) }'
-}
-
 set_defaults() {
-  mode="motion"
-  threshold="0.06"
-  hold_ms="90"
-  pulse_ms="12"
-  pulse_step="1.5"
-  max_speed="2.4"
-  accel="1.6"
-  deadzone="0.07"
-  natural="0"
-  diagonal="0"
-  twofinger="0"
-  grab="0"
+  mode="motion"; threshold="0.06"; hold_ms="90"; pulse_ms="12"; pulse_step="1.5"
+  max_speed="2.4"; accel="1.6"; deadzone="0.07"; natural="0"; diagonal="0"; twofinger="0"; grab="0"
+  dt_hold="0"; dt_min="50"; dt_max="290"
 }
 
 save_and_restart() {
@@ -185,339 +168,61 @@ save_and_restart() {
     echo "# Managed by edge-motion-config"
     echo "EDGE_MOTION_ARGS=\"${NEW_ARGS[*]}\""
   } > "$CONFIG_FILE"
-
   systemctl daemon-reload
   systemctl restart "$SERVICE_NAME"
 }
 
 run_manual_update() {
-  local updater="${EDGE_MOTION_UPDATER_BIN:-/usr/local/bin/edge-motion-auto-update}"
-  local output rc
-
-  if [[ ! -x "$updater" ]]; then
-    msg "$(txt "Команда обновления не найдена: $updater" "Update command not found: $updater")"
-    return 1
-  fi
-
-  output="$($updater 2>&1)"
-  rc=$?
-
-  if [[ -n "$output" ]]; then
-    msg "$output"
-  elif [[ $rc -eq 0 ]]; then
-    msg "$(txt 'Обновление завершено без дополнительного вывода.' 'Update finished without additional output.')"
-  else
-    msg "$(txt "Команда обновления завершилась с ошибкой (код $rc)." "Update command failed (exit code $rc).")"
-  fi
-
-  return $rc
+  local updater="/usr/local/bin/edge-motion-auto-update"
+  [[ ! -x "$updater" ]] && msg "Updater not found" && return 1
+  msg "$( $updater 2>&1 )"
 }
 
-zenity_pick_mode_and_toggles() {
-  local mode_h natural_h diagonal_h twofinger_h grab_h
-  local mode_values natural_values diagonal_values twofinger_values grab_values
-  [[ "$mode" == "motion" ]] && mode_h="motion" || mode_h="scroll"
-  [[ "$natural" == "1" ]] && natural_h="on" || natural_h="off"
-  [[ "$diagonal" == "1" ]] && diagonal_h="on" || diagonal_h="off"
-  [[ "$twofinger" == "1" ]] && twofinger_h="on" || twofinger_h="off"
-  [[ "$grab" == "1" ]] && grab_h="on" || grab_h="off"
-
-  [[ "$mode_h" == "motion" ]] && mode_values="motion|scroll" || mode_values="scroll|motion"
-  [[ "$natural_h" == "on" ]] && natural_values="on|off" || natural_values="off|on"
-  [[ "$diagonal_h" == "on" ]] && diagonal_values="on|off" || diagonal_values="off|on"
-  [[ "$twofinger_h" == "on" ]] && twofinger_values="on|off" || twofinger_values="off|on"
-  [[ "$grab_h" == "on" ]] && grab_values="on|off" || grab_values="off|on"
-
-  local out
-  out=$(zenity --forms --title="$(txt 'edge-motion: кнопки и режим' 'edge-motion: toggles and mode')" --width=560 \
-    --text="$(txt 'Выберите режим и переключатели' 'Choose mode and toggles')" \
-    --separator='|' \
-    --add-combo="Режим" --combo-values="$mode_values" \
-    --add-combo="Natural scroll" --combo-values="$natural_values" \
-    --add-combo="Diagonal scroll" --combo-values="$diagonal_values" \
-    --add-combo="Two-finger scroll" --combo-values="$twofinger_values" \
-    --add-combo="Grab touchpad" --combo-values="$grab_values") || return 1
-
-  local n d t g
-  IFS='|' read -r mode_h n d t g <<<"$out"
-  mode="$mode_h"
-  [[ "$n" == "on" ]] && natural=1 || natural=0
-  [[ "$d" == "on" ]] && diagonal=1 || diagonal=0
-  [[ "$t" == "on" ]] && twofinger=1 || twofinger=0
-  [[ "$g" == "on" ]] && grab=1 || grab=0
-}
-
-zenity_numeric_form() {
-  local out th hm pm ps ms ac dz
-  out=$(zenity --forms --title="$(txt 'edge-motion: ввод чисел' 'edge-motion: numeric input')" --width=560 \
-    --text="$(txt 'Введите числовые параметры' 'Enter numeric parameters')" --separator='|' \
-    --add-entry="threshold" --add-entry="hold-ms" --add-entry="pulse-ms" \
-    --add-entry="pulse-step" --add-entry="max-speed" --add-entry="accel-exponent" \
-    --add-entry="deadzone") || return 1
-
-  IFS='|' read -r th hm pm ps ms ac dz <<<"$out"
-
-  if ! validate_ranges "$mode" "$th" "$hm" "$pm" "$ps" "$ms" "$ac" "$dz"; then
-    msg "$(txt 'Часть значений вне допустимого диапазона.\nthreshold/deadzone: 0..0.49, hold-ms: 0..5000, pulse-ms: 1..500, pulse-step: >0..10, max-speed: >0..20, accel: 1..6' 'Some values are out of range.\nthreshold/deadzone: 0..0.49, hold-ms: 0..5000, pulse-ms: 1..500, pulse-step: >0..10, max-speed: >0..20, accel: 1..6')"
-    return 1
-  fi
-
-  threshold="$th"
-  hold_ms="$hm"
-  pulse_ms="$pm"
-  pulse_step="$ps"
-  max_speed="$ms"
-  accel="$ac"
-  deadzone="$dz"
-}
-
-zenity_sliders() {
-  local val
-
-  val=$(zenity --scale --title="threshold" --text="Ширина краевой зоны (0.00..0.49)" \
-    --value="$(to_scaled_int "$threshold" 100)" --min-value=0 --max-value=49 --step=1 --print-partial) || return 1
-  threshold="$(from_scaled_int "$val" 100 2)"
-
-  val=$(zenity --scale --title="hold-ms" --text="Задержка до старта (мс)" \
-    --value="$hold_ms" --min-value=0 --max-value=400 --step=1 --print-partial) || return 1
-  hold_ms="$val"
-
-  val=$(zenity --scale --title="pulse-ms" --text="Интервал импульсов (мс)" \
-    --value="$pulse_ms" --min-value=1 --max-value=80 --step=1 --print-partial) || return 1
-  pulse_ms="$val"
-
-  val=$(zenity --scale --title="pulse-step" --text="Базовый шаг (0.1..5.0)" \
-    --value="$(to_scaled_int "$pulse_step" 10)" --min-value=1 --max-value=50 --step=1 --print-partial) || return 1
-  pulse_step="$(from_scaled_int "$val" 10 1)"
-
-  val=$(zenity --scale --title="max-speed" --text="Макс. скорость (0.1..8.0)" \
-    --value="$(to_scaled_int "$max_speed" 10)" --min-value=1 --max-value=80 --step=1 --print-partial) || return 1
-  max_speed="$(from_scaled_int "$val" 10 1)"
-
-  val=$(zenity --scale --title="accel-exponent" --text="Ускорение (1.0..4.0)" \
-    --value="$(to_scaled_int "$accel" 10)" --min-value=10 --max-value=40 --step=1 --print-partial) || return 1
-  accel="$(from_scaled_int "$val" 10 1)"
-
-  val=$(zenity --scale --title="deadzone" --text="Мёртвая зона (0.00..0.49)" \
-    --value="$(to_scaled_int "$deadzone" 100)" --min-value=0 --max-value=49 --step=1 --print-partial) || return 1
-  deadzone="$(from_scaled_int "$val" 100 2)"
-}
-
-run_text_ui() {
+run_ui() {
   while true; do
-    local prompt mode_label natural_label diagonal_label twofinger_label grab_label lang_label
-    if [[ "$mode" == "motion" ]]; then mode_label="$(txt 'Курсор (motion)' 'Cursor (motion)')"; else mode_label="$(txt 'Скролл (scroll)' 'Scroll (scroll)')"; fi
-    if [[ "$natural" == "1" ]]; then natural_label="$(txt 'Вкл' 'On')"; else natural_label="$(txt 'Выкл' 'Off')"; fi
-    if [[ "$diagonal" == "1" ]]; then diagonal_label="Вкл"; else diagonal_label="Выкл"; fi
-    if [[ "$twofinger" == "1" ]]; then twofinger_label="Вкл"; else twofinger_label="Выкл"; fi
-    if [[ "$grab" == "1" ]]; then grab_label="$(txt 'Вкл' 'On')"; else grab_label="$(txt 'Выкл' 'Off')"; fi
-    lang_label="${LANGUAGE^^}"
-
-    prompt="$(txt 'Режим' 'Mode'): $mode_label\nthreshold=$threshold, hold-ms=$hold_ms, pulse-ms=$pulse_ms\npulse-step=$pulse_step, max-speed=$max_speed, accel=$accel, deadzone=$deadzone\nnatural=$natural_label, diagonal=$diagonal_label, two-finger=$twofinger_label, grab=$grab_label"
+    local mode_l dt_l
+    mode_l=$([[ "$mode" == "motion" ]] && txt "Курсор" "Cursor" || txt "Скролл" "Scroll")
+    dt_l=$([[ "$dt_hold" == "1" ]] && txt "Вкл (Двойной тап)" "On (Double-tap)" || txt "Выкл (Всегда)" "Off (Always)")
+    
+    local summary
+    summary="$(txt "Режим" "Mode"): $mode_l | $(txt "Двойной тап" "Double-tap"): $dt_l\nthreshold=$threshold, hold-ms=$hold_ms, pulse-ms=$pulse_ms, accel=$accel\ndt-window=$dt_min..$dt_max ms"
 
     local action
-    if command -v whiptail >/dev/null 2>&1; then
-      action=$(whiptail --title "$(txt 'edge-motion: меню настройки' 'edge-motion: configuration menu')" --menu "$prompt" 24 96 14 \
-        "mode" "Режим: $mode_label" \
-        "threshold" "Ширина краевой зоны: $threshold" \
-        "hold-ms" "Задержка перед стартом (мс): $hold_ms" \
-        "pulse-ms" "Интервал импульсов (мс): $pulse_ms" \
-        "pulse-step" "Базовый шаг импульса: $pulse_step" \
-        "max-speed" "Макс. скорость: $max_speed" \
-        "accel" "Степень ускорения: $accel" \
-        "deadzone" "Центральная мёртвая зона: $deadzone" \
-        "natural" "Natural scroll: $natural_label" \
-        "diagonal" "Диагональный скролл: $diagonal_label" \
-        "twofinger" "Скролл только 2 пальцами: $twofinger_label" \
-        "grab" "$(txt 'Эксклюзивный захват тачпада' 'Exclusive touchpad grab'): $grab_label" \
-        "lang" "$(txt 'Язык интерфейса' 'Interface language'): $lang_label" \
-        "save" "$(txt '💾 Сохранить и перезапустить' '💾 Save and restart')" \
-        "update" "$(txt '⬇ Проверить обновления сейчас' '⬇ Check updates now')" \
-        "reset" "$(txt '↺ Сбросить на оптимальные значения' '↺ Reset to recommended defaults')" \
-        "exit" "$(txt 'Выход без изменений' 'Exit without changes')" 3>&1 1>&2 2>&3) || action="exit"
-    else
-      echo -e "$prompt"
-      read -r -p "[mode/threshold/hold-ms/pulse-ms/pulse-step/max-speed/accel/deadzone/natural/diagonal/twofinger/grab/lang/save/update/reset/exit]: " action
-    fi
-
-    case "$action" in
-      mode)
-        if [[ "$mode" == "motion" ]]; then mode="scroll"; else mode="motion"; fi
-        ;;
-      lang)
-        if [[ "$LANGUAGE" == "ru" ]]; then LANGUAGE="en"; else LANGUAGE="ru"; fi
-        ;;
-      threshold|hold-ms|pulse-ms|pulse-step|max-speed|accel|deadzone)
-        local current regex question entered
-        case "$action" in
-          threshold) current="$threshold"; regex='^[0-9]+(\.[0-9]+)?$'; question="Новая ширина краевой зоны (например 0.06):" ;;
-          hold-ms) current="$hold_ms"; regex='^[0-9]+$'; question="Новая задержка hold-ms в мс (например 90):" ;;
-          pulse-ms) current="$pulse_ms"; regex='^[0-9]+$'; question="Новый pulse-ms в мс (например 12):" ;;
-          pulse-step) current="$pulse_step"; regex='^[0-9]+(\.[0-9]+)?$'; question="Новый pulse-step (например 1.5):" ;;
-          max-speed) current="$max_speed"; regex='^[0-9]+(\.[0-9]+)?$'; question="Новая max-speed (например 2.4):" ;;
-          accel) current="$accel"; regex='^[0-9]+(\.[0-9]+)?$'; question="Новый accel-exponent (например 1.6):" ;;
-          deadzone) current="$deadzone"; regex='^[0-9]+(\.[0-9]+)?$'; question="Новая deadzone (например 0.07):" ;;
-        esac
-
-        if command -v whiptail >/dev/null 2>&1; then
-          entered=$(whiptail --title "edge-motion: редактирование" --inputbox "$question" 11 78 "$current" 3>&1 1>&2 2>&3) || continue
-        else
-          read -r -p "$question " entered
-        fi
-
-        if ! validate "$regex" "$entered"; then
-          msg "$(txt 'Ошибка в формате значения. Попробуйте снова.' 'Invalid value format. Please try again.')"
-          continue
-        fi
-
-        case "$action" in
-          threshold) threshold="$entered" ;;
-          hold-ms) hold_ms="$entered" ;;
-          pulse-ms) pulse_ms="$entered" ;;
-          pulse-step) pulse_step="$entered" ;;
-          max-speed) max_speed="$entered" ;;
-          accel) accel="$entered" ;;
-          deadzone) deadzone="$entered" ;;
-        esac
-        ;;
-      natural)
-        if [[ "$natural" == "1" ]]; then natural="0"; else natural="1"; fi
-        ;;
-      diagonal)
-        if [[ "$diagonal" == "1" ]]; then diagonal="0"; else diagonal="1"; fi
-        ;;
-      twofinger)
-        if [[ "$twofinger" == "1" ]]; then twofinger="0"; else twofinger="1"; fi
-        ;;
-      grab)
-        if [[ "$grab" == "1" ]]; then grab="0"; else grab="1"; fi
-        ;;
-      lang)
-        if [[ "$LANGUAGE" == "ru" ]]; then LANGUAGE="en"; else LANGUAGE="ru"; fi
-        ;;
-      save)
-        if ! validate_ranges "$mode" "$threshold" "$hold_ms" "$pulse_ms" "$pulse_step" "$max_speed" "$accel" "$deadzone"; then
-          msg "$(txt 'Проверьте диапазоны числовых параметров перед сохранением.' 'Check numeric ranges before saving.')"
-          continue
-        fi
-        build_args "$mode" "$threshold" "$hold_ms" "$pulse_ms" "$pulse_step" "$max_speed" "$accel" "$deadzone" "$natural" "$diagonal" "$twofinger" "$grab"
-        if confirm "$(txt 'Сохранить и выполнить автоперезапуск сервиса с новыми параметрами?' 'Save and auto-restart the service with new settings?')"; then
-          save_and_restart
-          msg "$(txt 'Готово ✅. Конфиг сохранён в $CONFIG_FILE, сервис перезапущен.' 'Done ✅. Config saved to $CONFIG_FILE, service restarted.')"
-          break
-        fi
-        ;;
-      update)
-        run_manual_update || true
-        ;;
-      reset)
-        if confirm "$(txt 'Сбросить параметры на оптимальные значения по умолчанию?' 'Reset parameters to recommended defaults?')"; then
-          CURRENT_ARGS=("${DEFAULT_ARGS[@]}")
-          mode="motion"; threshold="0.06"; hold_ms="90"; pulse_ms="12"; pulse_step="1.5"
-          max_speed="2.4"; accel="1.6"; deadzone="0.07"; natural="0"; diagonal="0"; twofinger="0"; grab="0"
-          msg "$(txt 'Значения сброшены. Нажмите Save для применения.' 'Values have been reset. Press Save to apply.')"
-        fi
-        ;;
-      exit)
-        msg "$(txt 'Выход без изменений.' 'Exited without changes.')"
-        break
-        ;;
-      *)
-        msg "$(txt 'Неизвестная команда' 'Unknown command'): $action"
-        ;;
-    esac
-  done
-}
-
-run_zenity_ui() {
-  while true; do
-    local mode_label natural_label diagonal_label twofinger_label grab_label
-    if [[ "$mode" == "motion" ]]; then mode_label="$(txt 'Курсор (motion)' 'Cursor (motion)')"; else mode_label="$(txt 'Скролл (scroll)' 'Scroll (scroll)')"; fi
-    if [[ "$natural" == "1" ]]; then natural_label="$(txt 'Вкл' 'On')"; else natural_label="$(txt 'Выкл' 'Off')"; fi
-    if [[ "$diagonal" == "1" ]]; then diagonal_label="Вкл"; else diagonal_label="Выкл"; fi
-    if [[ "$twofinger" == "1" ]]; then twofinger_label="Вкл"; else twofinger_label="Выкл"; fi
-    if [[ "$grab" == "1" ]]; then grab_label="$(txt 'Вкл' 'On')"; else grab_label="$(txt 'Выкл' 'Off')"; fi
-    lang_label="${LANGUAGE^^}"
-
-    local summary action
-    summary="Режим: $mode_label\nthreshold=$threshold, hold-ms=$hold_ms, pulse-ms=$pulse_ms\npulse-step=$pulse_step, max-speed=$max_speed, accel=$accel, deadzone=$deadzone\nnatural=$natural_label, diagonal=$diagonal_label, two-finger=$twofinger_label, grab=$grab_label"
-
-    action=$(zenity --list --title="$(txt 'edge-motion: графическая настройка' 'edge-motion: GUI configuration')" --width=760 --height=520 \
-      --text="$summary" \
-      --column="$(txt 'Параметр' 'Key')" --column="$(txt 'Текущее значение' 'Current value')" \
-      "mode" "$mode_label" \
+    action=$(zenity --list --title="edge-motion config" --width=700 --height=550 \
+      --text="$summary" --column="$(txt 'Параметр' 'Key')" --column="$(txt 'Значение' 'Value')" \
+      "mode" "$mode_l" \
+      "double-tap" "$dt_l" \
       "threshold" "$threshold" \
       "hold-ms" "$hold_ms" \
       "pulse-ms" "$pulse_ms" \
       "pulse-step" "$pulse_step" \
       "max-speed" "$max_speed" \
       "accel" "$accel" \
-      "deadzone" "$deadzone" \
-      "natural" "$natural_label" \
-      "diagonal" "$diagonal_label" \
-      "twofinger" "$twofinger_label" \
-      "grab" "$grab_label" \
-      "lang" "${LANGUAGE^^}" \
-      --ok-label="$(txt 'Изменить' 'Change')" \
-      --extra-button="$(txt 'Сохранить' 'Save')" \
-      --extra-button="$(txt 'Обновить сейчас' 'Update now')" \
-      --extra-button="$(txt 'Сбросить' 'Reset')" \
-      --cancel-label="$(txt 'Выход' 'Exit')") || break
+      "dt-min" "$dt_min" \
+      "dt-max" "$dt_max" \
+      "natural" "$([[ "$natural" == "1" ]] && echo On || echo Off)" \
+      "grab" "$([[ "$grab" == "1" ]] && echo On || echo Off)" \
+      --ok-label="$(txt 'Изменить' 'Change')" --extra-button="$(txt 'Сохранить' 'Save')" \
+      --extra-button="$(txt 'Сброс' 'Reset')" --cancel-label="$(txt 'Выход' 'Exit')") || break
 
     case "$action" in
-      mode)
-        if [[ "$mode" == "motion" ]]; then mode="scroll"; else mode="motion"; fi
-        ;;
-      lang)
-        if [[ "$LANGUAGE" == "ru" ]]; then LANGUAGE="en"; else LANGUAGE="ru"; fi
-        ;;
-      threshold|hold-ms|pulse-ms|pulse-step|max-speed|accel|deadzone)
-        local current regex question entered
-        case "$action" in
-          threshold) current="$threshold"; regex='^[0-9]+(\.[0-9]+)?$'; question="Новая ширина краевой зоны (0..0.49):" ;;
-          hold-ms) current="$hold_ms"; regex='^[0-9]+$'; question="Новая задержка hold-ms (0..5000):" ;;
-          pulse-ms) current="$pulse_ms"; regex='^[0-9]+$'; question="Новый pulse-ms (1..500):" ;;
-          pulse-step) current="$pulse_step"; regex='^[0-9]+(\.[0-9]+)?$'; question="Новый pulse-step (>0..10):" ;;
-          max-speed) current="$max_speed"; regex='^[0-9]+(\.[0-9]+)?$'; question="Новая max-speed (>0..20):" ;;
-          accel) current="$accel"; regex='^[0-9]+(\.[0-9]+)?$'; question="Новый accel-exponent (1..6):" ;;
-          deadzone) current="$deadzone"; regex='^[0-9]+(\.[0-9]+)?$'; question="Новая deadzone (0..0.49):" ;;
-        esac
-
-        entered=$(zenity --entry --title="$(txt 'edge-motion: редактирование' 'edge-motion: edit value')" --text="$question" --entry-text="$current") || continue
-        if ! validate "$regex" "$entered"; then
-          msg "$(txt 'Ошибка в формате значения.' 'Invalid value format.')"
-          continue
-        fi
-        case "$action" in
-          threshold) threshold="$entered" ;;
-          hold-ms) hold_ms="$entered" ;;
-          pulse-ms) pulse_ms="$entered" ;;
-          pulse-step) pulse_step="$entered" ;;
-          max-speed) max_speed="$entered" ;;
-          accel) accel="$entered" ;;
-          deadzone) deadzone="$entered" ;;
-        esac
+      mode) [[ "$mode" == "motion" ]] && mode="scroll" || mode="motion" ;;
+      double-tap) [[ "$dt_hold" == "1" ]] && dt_hold="0" || dt_hold="1" ;;
+      natural) [[ "$natural" == "1" ]] && natural="0" || natural="1" ;;
+      grab) [[ "$grab" == "1" ]] && grab="0" || grab="1" ;;
+      threshold|hold-ms|pulse-ms|pulse-step|max-speed|accel|dt-min|dt-max)
+        local val
+        val=$(zenity --entry --title="Edit $action" --text="Enter new value for $action:" --entry-text="${!action//-/_}") || continue
+        # Workaround for bash variable naming
+        if [[ "$action" == "dt-min" ]]; then dt_min="$val"; elif [[ "$action" == "dt-max" ]]; then dt_max="$val"; else eval "$action=\"$val\""; fi
         ;;
       "$(txt 'Сохранить' 'Save')")
-        if ! validate_ranges "$mode" "$threshold" "$hold_ms" "$pulse_ms" "$pulse_step" "$max_speed" "$accel" "$deadzone"; then
-          msg "$(txt 'Проверьте диапазоны числовых параметров перед сохранением.' 'Check numeric ranges before saving.')"
-          continue
-        fi
-        build_args "$mode" "$threshold" "$hold_ms" "$pulse_ms" "$pulse_step" "$max_speed" "$accel" "$deadzone" "$natural" "$diagonal" "$twofinger" "$grab"
+        build_args
         save_and_restart
-        msg "$(txt 'Готово ✅. Конфиг сохранён в $CONFIG_FILE, сервис перезапущен.' 'Done ✅. Config saved to $CONFIG_FILE, service restarted.')"
+        msg "$(txt 'Сохранено и перезапущено.' 'Saved and restarted.')"
         break
         ;;
-      "$(txt 'Обновить сейчас' 'Update now')")
-        run_manual_update || true
-        ;;
-      "$(txt 'Сбросить' 'Reset')")
-        set_defaults
-        msg "$(txt 'Значения сброшены. Нажмите «Сохранить» для применения.' 'Values have been reset. Click Save to apply.')"
-        ;;
-      *)
-        msg "$(txt 'Неизвестное действие' 'Unknown action'): $action"
-        ;;
+      "$(txt 'Сброс' 'Reset')") set_defaults ;;
     esac
   done
 }
@@ -534,12 +239,9 @@ max_speed="$(find_opt --max-speed "${CURRENT_ARGS[@]}" || echo 2.4)"
 accel="$(find_opt --accel-exponent "${CURRENT_ARGS[@]}" || echo 1.6)"
 deadzone="$(find_opt --deadzone "${CURRENT_ARGS[@]}" || echo 0.07)"
 natural="$(find_opt --natural-scroll "${CURRENT_ARGS[@]}" || echo 0)"
-diagonal="$(find_opt --diagonal-scroll "${CURRENT_ARGS[@]}" || echo 0)"
-twofinger="$(find_opt --two-finger-scroll "${CURRENT_ARGS[@]}" || echo 0)"
-if find_opt --grab "${CURRENT_ARGS[@]}" >/dev/null; then grab=1; else grab=0; fi
+grab="$(find_opt --grab "${CURRENT_ARGS[@]}" || echo 0)"
+dt_hold="$(find_opt --double-tap-hold "${CURRENT_ARGS[@]}" || echo 0)"
+dt_min="$(find_opt --double-tap-window-min "${CURRENT_ARGS[@]}" || echo 50)"
+dt_max="$(find_opt --double-tap-window-max "${CURRENT_ARGS[@]}" || find_opt --double-tap-window "${CURRENT_ARGS[@]}" || echo 290)"
 
-if command -v zenity >/dev/null 2>&1 && [[ -n "${DISPLAY:-}" ]]; then
-  run_zenity_ui
-else
-  run_text_ui
-fi
+run_ui

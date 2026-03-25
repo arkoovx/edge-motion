@@ -12,7 +12,7 @@ fi
 
 status() {
   local text="$1"
-  logger -t edge-motion-auto-update "$text"
+  logger -t edge-motion-auto-update -- "$text"
   if [[ "$MANUAL_RUN" == "1" ]]; then
     echo "$text"
   fi
